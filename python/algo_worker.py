@@ -71,6 +71,7 @@ DEFAULT_STRATEGY = {
     "max_trades_per_day": 1,
     "max_open_positions": 1,
     "live_trading_enabled": 0,
+    "execution_mode": "PENDING_BEFORE_SIGNAL",
 }
 
 
@@ -155,6 +156,7 @@ def connect() -> sqlite3.Connection:
             max_trades_per_day INTEGER NOT NULL DEFAULT 1,
             max_open_positions INTEGER NOT NULL DEFAULT 1,
             live_trading_enabled INTEGER NOT NULL DEFAULT 0,
+            execution_mode TEXT NOT NULL DEFAULT 'PENDING_BEFORE_SIGNAL',
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS signal_log (
@@ -190,6 +192,10 @@ def connect() -> sqlite3.Connection:
     ensure_column(connection, "strategies", "first_trail_lock_loss_unit", "TEXT NOT NULL DEFAULT 'POINTS'")
     ensure_column(connection, "strategies", "second_trail_profit_unit", "TEXT NOT NULL DEFAULT 'POINTS'")
     ensure_column(connection, "strategies", "live_trading_enabled", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(connection, "strategies", "execution_mode", "TEXT NOT NULL DEFAULT 'PENDING_BEFORE_SIGNAL'")
+    ensure_column(connection, "runtime", "buy_trigger_override", "REAL")
+    ensure_column(connection, "runtime", "sell_trigger_override", "REAL")
+    ensure_column(connection, "runtime", "trigger_override_day", "TEXT NOT NULL DEFAULT ''")
     connection.execute(
         """
         INSERT OR IGNORE INTO runtime (id, running, algo_status)
@@ -236,6 +242,7 @@ def row_to_strategy(row: sqlite3.Row) -> dict[str, Any]:
         "max_trades_per_day": row["max_trades_per_day"],
         "max_open_positions": row["max_open_positions"],
         "live_trading_enabled": bool(row["live_trading_enabled"]),
+        "execution_mode": row["execution_mode"] or "PENDING_BEFORE_SIGNAL",
         "updated_at": row["updated_at"],
     }
 
@@ -255,6 +262,9 @@ def normalize_strategy(values: dict[str, Any], existing_id: str | None = None) -
     entry_pattern = str(merged.get("entry_pattern", "BOTH")).upper()
     if entry_pattern not in {"BOTH", "BUY_ONLY", "SELL_ONLY"}:
         raise ValueError("Entry pattern must be BOTH, BUY_ONLY or SELL_ONLY.")
+    execution_mode = str(merged.get("execution_mode") or "PENDING_BEFORE_SIGNAL").upper()
+    if execution_mode not in {"PENDING_BEFORE_SIGNAL", "MARKET_AFTER_SIGNAL", "REARM_PENDING"}:
+        raise ValueError("Execution mode is invalid.")
     from_date = datetime.strptime(str(merged.get("from_date")), "%Y-%m-%d").date()
     to_date = datetime.strptime(str(merged.get("to_date")), "%Y-%m-%d").date()
     if from_date > to_date:
@@ -294,6 +304,7 @@ def normalize_strategy(values: dict[str, Any], existing_id: str | None = None) -
         "max_trades_per_day": int(merged.get("max_trades_per_day", 1)),
         "max_open_positions": int(merged.get("max_open_positions", 1)),
         "live_trading_enabled": 1 if merged.get("live_trading_enabled") else 0,
+        "execution_mode": execution_mode,
         "updated_at": str(merged.get("updated_at") or now_utc()),
     }
 
@@ -307,7 +318,7 @@ def upsert_strategy(connection: sqlite3.Connection, strategy: dict[str, Any]) ->
             entry_buffer_pct, entry_buffer_points, stop_points, stop_points_unit,
             first_trail_profit, first_trail_profit_unit, first_trail_lock_loss,
             first_trail_lock_loss_unit, second_trail_profit, second_trail_profit_unit, volume, target_points,
-            max_trades_per_day, max_open_positions, live_trading_enabled, updated_at
+            max_trades_per_day, max_open_positions, live_trading_enabled, execution_mode, updated_at
         )
         VALUES (
             :id, :name, :data_source, :symbol, :timeframe, :trail_timeframe, :entry_pattern,
@@ -315,7 +326,7 @@ def upsert_strategy(connection: sqlite3.Connection, strategy: dict[str, Any]) ->
             :entry_buffer_pct, :entry_buffer_points, :stop_points, :stop_points_unit,
             :first_trail_profit, :first_trail_profit_unit, :first_trail_lock_loss,
             :first_trail_lock_loss_unit, :second_trail_profit, :second_trail_profit_unit, :volume, :target_points,
-            :max_trades_per_day, :max_open_positions, :live_trading_enabled, :updated_at
+            :max_trades_per_day, :max_open_positions, :live_trading_enabled, :execution_mode, :updated_at
         )
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
@@ -346,6 +357,7 @@ def upsert_strategy(connection: sqlite3.Connection, strategy: dict[str, Any]) ->
             max_trades_per_day=excluded.max_trades_per_day,
             max_open_positions=excluded.max_open_positions,
             live_trading_enabled=excluded.live_trading_enabled,
+            execution_mode=excluded.execution_mode,
             updated_at=excluded.updated_at
         """,
         strategy,
@@ -450,6 +462,7 @@ def runtime_state(connection: sqlite3.Connection) -> dict[str, Any]:
         active_row = connection.execute("SELECT * FROM strategies WHERE id = ?", (row["active_strategy_id"],)).fetchone()
         active = row_to_strategy(active_row) if active_row else None
     live_quote = fetch_live_quote(active["symbol"]) if active and active.get("data_source") == "MT5" else {}
+    broker_state = fetch_mt5_trade_state(active["symbol"]) if active and active.get("data_source") == "MT5" else {"pending_orders": [], "open_positions": []}
     signals = [
         {**dict(item), "payload": json.loads(item["payload_json"] or "{}")}
         for item in connection.execute("SELECT * FROM signal_log ORDER BY created_at DESC LIMIT 50").fetchall()
@@ -471,8 +484,13 @@ def runtime_state(connection: sqlite3.Connection) -> dict[str, Any]:
         "last_error": row["last_error"],
         "algo_status": row["algo_status"],
         "pending_order_day": row["pending_order_day"],
+        "buy_trigger_override": row["buy_trigger_override"],
+        "sell_trigger_override": row["sell_trigger_override"],
+        "trigger_override_day": row["trigger_override_day"],
         "last_signal": last_signal,
         "live_quote": live_quote,
+        "pending_orders": broker_state["pending_orders"],
+        "open_positions": broker_state["open_positions"],
         "strategies": list_strategies(connection),
         "signal_log": signals,
         "trade_log": trades,
@@ -515,6 +533,49 @@ def fetch_live_quote(symbol: str) -> dict[str, Any]:
             "spread": ask - bid if ask and bid else None,
             "time": quote_time.isoformat(),
         }
+    finally:
+        mt5.shutdown()
+
+
+def fetch_mt5_trade_state(symbol: str) -> dict[str, Any]:
+    if mt5 is None or not symbol:
+        return {"pending_orders": [], "open_positions": []}
+    if not mt5.initialize():
+        return {"pending_orders": [], "open_positions": [], "error": f"MT5 initialize failed: {mt5.last_error()}"}
+    try:
+        orders = mt5.orders_get(symbol=symbol)
+        positions = mt5.positions_get(symbol=symbol)
+        pending_orders = []
+        for order in orders or []:
+            if int(getattr(order, "magic", 0) or 0) != TRADE_MAGIC:
+                continue
+            order_type = int(getattr(order, "type", -1))
+            side = "BUY" if order_type in {getattr(mt5, "ORDER_TYPE_BUY_STOP", 4), getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)} else "SELL"
+            pending_orders.append({
+                "ticket": int(getattr(order, "ticket", 0) or 0),
+                "side": side,
+                "price": float(getattr(order, "price_open", 0.0) or 0.0),
+                "stop_loss": float(getattr(order, "sl", 0.0) or 0.0),
+                "take_profit": float(getattr(order, "tp", 0.0) or 0.0),
+                "volume": float(getattr(order, "volume_current", 0.0) or 0.0),
+                "state": int(getattr(order, "state", 0) or 0),
+                "comment": str(getattr(order, "comment", "") or ""),
+            })
+        open_positions = []
+        for position in positions or []:
+            if int(getattr(position, "magic", 0) or 0) != TRADE_MAGIC:
+                continue
+            open_positions.append({
+                "ticket": int(getattr(position, "ticket", 0) or 0),
+                "side": "BUY" if int(getattr(position, "type", 0) or 0) == getattr(mt5, "POSITION_TYPE_BUY", 0) else "SELL",
+                "price": float(getattr(position, "price_open", 0.0) or 0.0),
+                "current_price": float(getattr(position, "price_current", 0.0) or 0.0),
+                "stop_loss": float(getattr(position, "sl", 0.0) or 0.0),
+                "take_profit": float(getattr(position, "tp", 0.0) or 0.0),
+                "volume": float(getattr(position, "volume", 0.0) or 0.0),
+                "profit": float(getattr(position, "profit", 0.0) or 0.0),
+            })
+        return {"pending_orders": pending_orders, "open_positions": open_positions}
     finally:
         mt5.shutdown()
 
@@ -569,6 +630,30 @@ def choose_signal(candle: dict[str, Any], buy_trigger: float, sell_trigger: floa
     return ""
 
 
+def signal_outcome_reached(
+    candles: list[dict[str, Any]],
+    trigger_time: datetime,
+    side: str,
+    first_target: float,
+    stop_loss: float,
+) -> str | None:
+    """Return a completed safety outcome that makes a later re-entry unsafe."""
+    for candle in candles:
+        if candle["time_ist"] < trigger_time:
+            continue
+        if side == "BUY":
+            if float(candle["low"]) <= stop_loss + PRICE_EPSILON:
+                return "STOP_LOSS_REACHED"
+            if float(candle["high"]) + PRICE_EPSILON >= first_target:
+                return "FIRST_TARGET_REACHED"
+        else:
+            if float(candle["high"]) + PRICE_EPSILON >= stop_loss:
+                return "STOP_LOSS_REACHED"
+            if float(candle["low"]) <= first_target + PRICE_EPSILON:
+                return "FIRST_TARGET_REACHED"
+    return None
+
+
 def first_trail_lock_stop(entry_price: float, lock_distance: float, side: str) -> float:
     effective_lock = max(float(lock_distance), 0.0)
     return entry_price + effective_lock if side == "BUY" else entry_price - effective_lock
@@ -583,7 +668,7 @@ def scan_signal(connection: sqlite3.Connection, strategy_id: str | None = None) 
     if row is None:
         raise ValueError("Active strategy not found.")
     strategy = row_to_strategy(row)
-    runtime = connection.execute("SELECT running FROM runtime WHERE id = 1").fetchone()
+    runtime = connection.execute("SELECT running, started_at FROM runtime WHERE id = 1").fetchone()
     running = bool(runtime["running"]) if runtime else False
     checked_at = now_ist()
     if strategy["data_source"] != "MT5":
@@ -630,8 +715,14 @@ def scan_signal(connection: sqlite3.Connection, strategy_id: str | None = None) 
         return result
     range_high = max(float(item["high"]) for item in range_candles)
     range_low = min(float(item["low"]) for item in range_candles)
-    buy_trigger = range_high * (1 + strategy["entry_buffer_pct"] / 100) + strategy["entry_buffer_points"]
-    sell_trigger = range_low * (1 - strategy["entry_buffer_pct"] / 100) - strategy["entry_buffer_points"]
+    calculated_buy_trigger = range_high * (1 + strategy["entry_buffer_pct"] / 100) + strategy["entry_buffer_points"]
+    calculated_sell_trigger = range_low * (1 - strategy["entry_buffer_pct"] / 100) - strategy["entry_buffer_points"]
+    override = connection.execute(
+        "SELECT buy_trigger_override, sell_trigger_override, trigger_override_day FROM runtime WHERE id = 1"
+    ).fetchone()
+    override_active = bool(override and override["trigger_override_day"] == checked_at.date().isoformat())
+    buy_trigger = float(override["buy_trigger_override"]) if override_active and override["buy_trigger_override"] is not None else calculated_buy_trigger
+    sell_trigger = float(override["sell_trigger_override"]) if override_active and override["sell_trigger_override"] is not None else calculated_sell_trigger
     result.update(
         {
             "last_candle_time": candles[-1]["time_ist"].isoformat() if candles else "",
@@ -640,9 +731,13 @@ def scan_signal(connection: sqlite3.Connection, strategy_id: str | None = None) 
             "range_low": range_low,
             "buy_trigger": buy_trigger,
             "sell_trigger": sell_trigger,
+            "calculated_buy_trigger": calculated_buy_trigger,
+            "calculated_sell_trigger": calculated_sell_trigger,
+            "trigger_override_active": override_active,
             "buffer": f"{strategy['entry_buffer_pct']}%",
         }
     )
+    result["position_action"] = manage_live_positions(connection, strategy, running, checked_at, session_right)
     if checked_at < range_right:
         result.update({"message": "Range window is still forming."})
         save_signal_result(connection, result)
@@ -652,6 +747,7 @@ def scan_signal(connection: sqlite3.Connection, strategy_id: str | None = None) 
         save_signal_result(connection, result)
         return result
     if checked_at > session_right:
+        cancel_algo_pending_orders(strategy["symbol"], "Session ended")
         result.update({"phase": "SESSION_DONE", "status": "Done", "message": "Session finished."})
         save_signal_result(connection, result)
         return result
@@ -699,9 +795,60 @@ def scan_signal(connection: sqlite3.Connection, strategy_id: str | None = None) 
             }
         )
         break
-    if result.get("side"):
+    mode = str(strategy.get("execution_mode") or "PENDING_BEFORE_SIGNAL")
+    placement_start = max(range_right, session_left)
+    if not result.get("side"):
+        if mode == "MARKET_AFTER_SIGNAL":
+            result["pending_action"] = {"status": "waiting_signal", "message": "Waiting for a signal; this mode does not place pending orders."}
+        else:
+            result["pending_action"] = manage_pending_orders(
+                connection, strategy, running, checked_at, placement_start, cutoff_right, buy_trigger, sell_trigger
+            )
+    else:
         result["live_quote"] = fetch_live_quote(strategy["symbol"])
-        result["trade_action"] = maybe_execute_live_trade(connection, strategy, result, running)
+        trigger_time = datetime.fromisoformat(str(result["trigger_candle_time"]))
+        started_at = str(runtime["started_at"] or "") if runtime else ""
+        started_after_signal = False
+        if started_at:
+            started_time = datetime.fromisoformat(started_at)
+            if started_time.tzinfo is None:
+                started_time = started_time.replace(tzinfo=UTC)
+            started_after_signal = started_time.astimezone(IST) > trigger_time
+        result["started_after_signal"] = started_after_signal
+        cancellation = cancel_algo_pending_orders(strategy["symbol"], "Signal crossed - stale pending orders removed")
+        if mode == "MARKET_AFTER_SIGNAL" and started_after_signal:
+            result["trade_action"] = maybe_execute_live_trade(connection, strategy, result, running)
+        elif mode == "REARM_PENDING" and started_after_signal:
+            outcome = signal_outcome_reached(
+                eligible,
+                trigger_time,
+                str(result["side"]),
+                float(result["first_trail_trigger"]),
+                float(result["stop_loss"]),
+            )
+            if outcome:
+                result["trade_action"] = {
+                    "status": "REARM_BLOCKED",
+                    "message": f"Pending re-entry blocked: {outcome.replace('_', ' ').lower()} today.",
+                }
+            else:
+                result["trade_action"] = manage_pending_orders(
+                    connection,
+                    strategy,
+                    running,
+                    checked_at,
+                    placement_start,
+                    cutoff_right,
+                    buy_trigger,
+                    sell_trigger,
+                    {str(result["side"])},
+                )
+        else:
+            result["trade_action"] = {
+                "status": "SIGNAL_ALREADY_CROSSED",
+                "message": "Signal is already crossed; no new order was placed for this execution mode.",
+                "cancellation": cancellation,
+            }
     save_signal_result(connection, result)
     return result
 
@@ -837,6 +984,384 @@ def signal_trade_log(connection: sqlite3.Connection, result: dict[str, Any]) -> 
     return None
 
 
+def cancel_algo_pending_orders(symbol: str, reason: str) -> dict[str, Any]:
+    if mt5 is None or not symbol or not mt5.initialize():
+        return {"status": "cancel_unavailable", "message": "MT5 is unavailable."}
+    cancelled: list[int] = []
+    errors: list[str] = []
+    try:
+        for order in mt5.orders_get(symbol=symbol) or []:
+            if int(getattr(order, "magic", 0) or 0) != TRADE_MAGIC:
+                continue
+            ticket = int(getattr(order, "ticket", 0) or 0)
+            response = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": ticket, "comment": "AlgoCancel"})
+            data = response._asdict() if response is not None and hasattr(response, "_asdict") else {}
+            if int(data.get("retcode", 0)) == getattr(mt5, "TRADE_RETCODE_DONE", 10009):
+                cancelled.append(ticket)
+            else:
+                errors.append(str(data.get("comment") or mt5.last_error()))
+        return {"status": "cancelled" if cancelled else "none", "message": reason, "tickets": cancelled, "errors": errors}
+    finally:
+        mt5.shutdown()
+
+
+def position_ticket_logged(connection: sqlite3.Connection, ticket: int) -> bool:
+    for row in connection.execute("SELECT payload_json FROM trade_log ORDER BY id DESC LIMIT 200").fetchall():
+        try:
+            if int(json.loads(row["payload_json"] or "{}").get("position_ticket") or 0) == ticket:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def log_open_position(connection: sqlite3.Connection, strategy: dict[str, Any], position: Any) -> None:
+    ticket = int(getattr(position, "ticket", 0) or 0)
+    if not ticket or position_ticket_logged(connection, ticket):
+        return
+    side = "BUY" if int(getattr(position, "type", 0) or 0) == getattr(mt5, "POSITION_TYPE_BUY", 0) else "SELL"
+    payload = {
+        "position_ticket": ticket,
+        "strategy_id": strategy["id"],
+        "symbol": strategy["symbol"],
+        "side": side,
+        "volume": float(getattr(position, "volume", 0.0) or 0.0),
+        "entry_price": float(getattr(position, "price_open", 0.0) or 0.0),
+        "stop_loss": float(getattr(position, "sl", 0.0) or 0.0),
+        "status": "POSITION_OPEN",
+    }
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO trade_log (created_at, strategy_id, symbol, side, entry_price, stop_loss, status, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (now_ist().isoformat(), strategy["id"], strategy["symbol"], side, payload["entry_price"], payload["stop_loss"], "POSITION_OPEN", json.dumps(payload, separators=(",", ":"))),
+        )
+
+
+def modify_position_stop(position: Any, stop_loss: float, reason: str, digits: int) -> dict[str, Any]:
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": str(getattr(position, "symbol", "")),
+        "position": int(getattr(position, "ticket", 0) or 0),
+        "sl": round(float(stop_loss), digits),
+        "tp": float(getattr(position, "tp", 0.0) or 0.0),
+        "magic": TRADE_MAGIC,
+        "comment": reason[:31],
+    }
+    response = mt5.order_send(request)
+    data = response._asdict() if response is not None and hasattr(response, "_asdict") else {}
+    ok = int(data.get("retcode", 0)) == getattr(mt5, "TRADE_RETCODE_DONE", 10009)
+    return {"status": "SL_MODIFIED" if ok else "SL_MODIFY_FAILED", "message": str(data.get("comment") or mt5.last_error()), "stop_loss": request["sl"], "retcode": data.get("retcode")}
+
+
+def close_position(position: Any, reason: str) -> dict[str, Any]:
+    symbol = str(getattr(position, "symbol", ""))
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return {"status": "CLOSE_FAILED", "message": f"No live tick for {symbol}."}
+    is_buy = int(getattr(position, "type", 0) or 0) == getattr(mt5, "POSITION_TYPE_BUY", 0)
+    base = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "position": int(getattr(position, "ticket", 0) or 0),
+        "volume": float(getattr(position, "volume", 0.0) or 0.0),
+        "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+        "price": float(tick.bid if is_buy else tick.ask),
+        "deviation": ORDER_DEVIATION,
+        "magic": TRADE_MAGIC,
+        "comment": reason[:31],
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+    last: dict[str, Any] = {}
+    for filling in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
+        request = {**base, "type_filling": filling}
+        check = mt5.order_check(request)
+        check_data = check._asdict() if check is not None and hasattr(check, "_asdict") else {}
+        if int(check_data.get("retcode", -1)) != 0:
+            last = check_data
+            continue
+        response = mt5.order_send(request)
+        data = response._asdict() if response is not None and hasattr(response, "_asdict") else {}
+        last = data
+        if int(data.get("retcode", 0)) in {getattr(mt5, "TRADE_RETCODE_DONE", 10009), getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)}:
+            return {"status": "POSITION_CLOSED", "message": reason, "ticket": data.get("deal") or data.get("order"), "retcode": data.get("retcode")}
+    return {"status": "CLOSE_FAILED", "message": str(last.get("comment") or mt5.last_error()), "retcode": last.get("retcode")}
+
+
+def last_completed_trail_level(symbol: str, timeframe_name: str, side: str) -> float | None:
+    rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe(timeframe_name), 0, 3)
+    if rates is None or len(rates) < 2:
+        return None
+    candle = rates[-2]
+    return float(candle["low"] if side == "BUY" else candle["high"])
+
+
+def manage_live_positions(
+    connection: sqlite3.Connection,
+    strategy: dict[str, Any],
+    running: bool,
+    checked_at: datetime,
+    session_end: datetime,
+) -> dict[str, Any]:
+    if not running or mt5 is None:
+        return {"status": "disabled", "message": "Live position management is disabled."}
+    if not mt5.initialize():
+        return {"status": "error", "message": f"MT5 initialize failed: {mt5.last_error()}"}
+    try:
+        symbol = strategy["symbol"]
+        positions = [p for p in (mt5.positions_get(symbol=symbol) or []) if int(getattr(p, "magic", 0) or 0) == TRADE_MAGIC]
+        if not positions:
+            return {"status": "no_position", "message": "No live algo position."}
+        for order in mt5.orders_get(symbol=symbol) or []:
+            if int(getattr(order, "magic", 0) or 0) == TRADE_MAGIC:
+                mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": int(order.ticket), "comment": "AlgoCancel"})
+        position = positions[0]
+        log_open_position(connection, strategy, position)
+        if checked_at >= session_end:
+            return close_position(position, "Algo force exit")
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return {"status": "error", "message": "Symbol information unavailable."}
+        digits = int(getattr(info, "digits", 2) or 2)
+        side = "BUY" if int(getattr(position, "type", 0) or 0) == getattr(mt5, "POSITION_TYPE_BUY", 0) else "SELL"
+        entry = float(getattr(position, "price_open", 0.0) or 0.0)
+        current = float(getattr(position, "price_current", 0.0) or 0.0)
+        current_sl = float(getattr(position, "sl", 0.0) or 0.0)
+        move = current - entry if side == "BUY" else entry - current
+        first_distance = distance_to_points(strategy["first_trail_profit"], strategy["first_trail_profit_unit"], entry)
+        lock_distance = distance_to_points(strategy["first_trail_lock_loss"], strategy["first_trail_lock_loss_unit"], entry)
+        second_distance = distance_to_points(strategy["second_trail_profit"], strategy["second_trail_profit_unit"], entry)
+        first_lock = entry + lock_distance if side == "BUY" else entry - lock_distance
+        if move >= first_distance + second_distance:
+            candle_stop = last_completed_trail_level(symbol, strategy["trail_timeframe"], side)
+            if candle_stop is not None:
+                candidate = max(first_lock, candle_stop) if side == "BUY" else min(first_lock, candle_stop)
+                improves = current_sl <= 0 or (candidate > current_sl if side == "BUY" else candidate < current_sl)
+                valid_side = candidate < current if side == "BUY" else candidate > current
+                if improves and valid_side:
+                    return {**modify_position_stop(position, candidate, "Second target trail", digits), "stage": "SECOND_TRAIL", "move": move}
+            return {"status": "SECOND_TRAIL_ACTIVE", "message": "Waiting for a better completed trail candle.", "stage": "SECOND_TRAIL", "move": move, "stop_loss": current_sl}
+        if move >= first_distance:
+            improves = current_sl <= 0 or (first_lock > current_sl if side == "BUY" else first_lock < current_sl)
+            valid_side = first_lock < current if side == "BUY" else first_lock > current
+            if improves and valid_side:
+                return {**modify_position_stop(position, first_lock, "First target SL lock", digits), "stage": "FIRST_LOCK", "move": move}
+            return {"status": "FIRST_LOCK_ACTIVE", "message": "First target reached; SL lock is active.", "stage": "FIRST_LOCK", "move": move, "stop_loss": current_sl}
+        return {"status": "POSITION_MONITORED", "message": "Live position is being monitored.", "stage": "INITIAL", "move": move, "stop_loss": current_sl}
+    finally:
+        mt5.shutdown()
+
+
+def manage_pending_orders(
+    connection: sqlite3.Connection,
+    strategy: dict[str, Any],
+    running: bool,
+    checked_at: datetime,
+    placement_start: datetime,
+    placement_end: datetime,
+    buy_trigger: float,
+    sell_trigger: float,
+    allowed_sides: set[str] | None = None,
+) -> dict[str, Any]:
+    if not running:
+        return {"status": "not_running", "message": "Algo is not running."}
+    if not strategy.get("live_trading_enabled"):
+        cancelled = cancel_algo_pending_orders(strategy["symbol"], "Live orders disabled")
+        return {"status": "disabled", "message": "Auto Trade is disabled; pending orders were cancelled.", "cancellation": cancelled}
+    if checked_at < placement_start:
+        return {"status": "waiting_range", "message": "Pending orders will be sent after the range is complete."}
+    if checked_at > placement_end:
+        cancelled = cancel_algo_pending_orders(strategy["symbol"], "Entry cutoff reached")
+        return {"status": "entry_closed", "message": "Entry cutoff reached; remaining pending orders were cancelled.", "cancellation": cancelled}
+    if mt5 is None:
+        return {"status": "error", "message": "MetaTrader5 Python package is not installed."}
+    symbol = strategy["symbol"]
+    if not mt5.initialize():
+        return {"status": "error", "message": f"MT5 initialize failed: {mt5.last_error()}"}
+    try:
+        if not mt5.symbol_select(symbol, True):
+            return {"status": "error", "message": f"Symbol not available in MT5 Market Watch: {symbol}"}
+        positions = [p for p in (mt5.positions_get(symbol=symbol) or []) if int(getattr(p, "magic", 0) or 0) == TRADE_MAGIC]
+        orders = [o for o in (mt5.orders_get(symbol=symbol) or []) if int(getattr(o, "magic", 0) or 0) == TRADE_MAGIC]
+        if positions:
+            for order in orders:
+                mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": int(order.ticket), "comment": "AlgoCancel"})
+            return {"status": "position_open", "message": "Position is open; opposite pending order removed."}
+        if orders:
+            return {"status": "pending_live", "message": f"{len(orders)} pending order(s) live in MT5.", "tickets": [int(o.ticket) for o in orders]}
+
+        tick = mt5.symbol_info_tick(symbol)
+        info = mt5.symbol_info(symbol)
+        if tick is None or info is None:
+            return {"status": "error", "message": f"Live symbol data unavailable for {symbol}."}
+        ask = float(tick.ask)
+        bid = float(tick.bid)
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        digits = int(getattr(info, "digits", 2) or 2)
+        minimum_gap = float(getattr(info, "trade_stops_level", 0) or 0) * point
+        sides = allowed_sides or {"BUY", "SELL"}
+        if "BUY" in sides and buy_trigger <= ask + minimum_gap:
+            return {"status": "level_passed", "message": "BUY trigger is already at/past market price; pending order was not sent."}
+        if "SELL" in sides and sell_trigger >= bid - minimum_gap:
+            return {"status": "level_passed", "message": "SELL trigger is already at/past market price; pending order was not sent."}
+
+        volume = float(strategy.get("volume") or 0.01)
+        volume_min = float(getattr(info, "volume_min", 0.0) or 0.0)
+        volume_max = float(getattr(info, "volume_max", 0.0) or 0.0)
+        volume_step = float(getattr(info, "volume_step", 0.0) or 0.0)
+        if volume < volume_min or (volume_max > 0 and volume > volume_max):
+            return {"status": "invalid_volume", "message": f"Lot {volume} is outside broker range {volume_min}-{volume_max}."}
+        if volume_step > 0 and abs(round(volume / volume_step) * volume_step - volume) > 1e-9:
+            return {"status": "invalid_volume", "message": f"Lot {volume} does not match broker step {volume_step}."}
+        stop_distance_buy = distance_to_points(strategy["stop_points"], strategy["stop_points_unit"], buy_trigger)
+        stop_distance_sell = distance_to_points(strategy["stop_points"], strategy["stop_points_unit"], sell_trigger)
+        target_points = float(strategy.get("target_points") or 0.0)
+        requests = [
+            ("BUY", mt5.ORDER_TYPE_BUY_STOP, buy_trigger, buy_trigger - stop_distance_buy, buy_trigger + target_points if target_points > 0 else 0.0),
+            ("SELL", mt5.ORDER_TYPE_SELL_STOP, sell_trigger, sell_trigger + stop_distance_sell, sell_trigger - target_points if target_points > 0 else 0.0),
+        ]
+        requests = [item for item in requests if item[0] in sides]
+        placed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        success_codes = {getattr(mt5, "TRADE_RETCODE_DONE", 10009), getattr(mt5, "TRADE_RETCODE_PLACED", 10008)}
+        for side, order_type, price, stop_loss, take_profit in requests:
+            price = round(float(price), digits)
+            stop_loss = round(float(stop_loss), digits)
+            take_profit = round(float(take_profit), digits) if take_profit else 0.0
+            request: dict[str, Any] = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": volume,
+                "type": order_type,
+                "price": float(price),
+                "sl": float(stop_loss),
+                "deviation": ORDER_DEVIATION,
+                "magic": TRADE_MAGIC,
+                "comment": f"AlgoDesk {side} {strategy['id'][:6]}",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_RETURN,
+            }
+            if take_profit:
+                request["tp"] = float(take_profit)
+            check = mt5.order_check(request)
+            check_data = check._asdict() if check is not None and hasattr(check, "_asdict") else {}
+            if check is None or int(check_data.get("retcode", -1)) != 0:
+                failed.append({"side": side, "ticket": None, "retcode": check_data.get("retcode"), "message": check_data.get("comment") or str(mt5.last_error()), "price": price, "stop_loss": stop_loss})
+                continue
+            response = mt5.order_send(request)
+            data = response._asdict() if response is not None and hasattr(response, "_asdict") else {}
+            item = {"side": side, "ticket": data.get("order"), "retcode": data.get("retcode"), "message": data.get("comment"), "price": price, "stop_loss": stop_loss}
+            (placed if int(data.get("retcode", 0)) in success_codes else failed).append(item)
+        if placed:
+            with connection:
+                connection.execute("UPDATE runtime SET pending_order_day = ? WHERE id = 1", (checked_at.date().isoformat(),))
+        return {
+            "status": "pending_live" if len(placed) == len(requests) else "pending_partial" if placed else "pending_failed",
+            "message": f"{len(placed)} pending order(s) placed; {len(failed)} failed.",
+            "orders": placed,
+            "errors": failed,
+        }
+    finally:
+        mt5.shutdown()
+
+
+def update_pending_trigger(
+    connection: sqlite3.Connection,
+    strategy: dict[str, Any],
+    side: str,
+    requested_price: float,
+) -> dict[str, Any]:
+    side = side.upper()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("Side must be BUY or SELL.")
+    if requested_price <= 0:
+        raise ValueError("Trigger price must be greater than zero.")
+    if strategy.get("entry_pattern") == "BUY_ONLY" and side == "SELL":
+        raise ValueError("SELL entries are disabled for this strategy.")
+    if strategy.get("entry_pattern") == "SELL_ONLY" and side == "BUY":
+        raise ValueError("BUY entries are disabled for this strategy.")
+    if mt5 is None or not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error() if mt5 else 'package unavailable'}")
+    try:
+        symbol = strategy["symbol"]
+        if not mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"Symbol not available in MT5 Market Watch: {symbol}")
+        info = mt5.symbol_info(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        if info is None or tick is None:
+            raise RuntimeError(f"Live symbol data unavailable for {symbol}.")
+        digits = int(getattr(info, "digits", 2) or 2)
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        minimum_gap = float(getattr(info, "trade_stops_level", 0) or 0) * point
+        price = round(float(requested_price), digits)
+        if side == "BUY" and price <= float(tick.ask) + minimum_gap:
+            raise ValueError(f"BUY STOP must be above current Ask {float(tick.ask):.{digits}f}.")
+        if side == "SELL" and price >= float(tick.bid) - minimum_gap:
+            raise ValueError(f"SELL STOP must be below current Bid {float(tick.bid):.{digits}f}.")
+        stop_distance = distance_to_points(strategy["stop_points"], strategy["stop_points_unit"], price)
+        stop_loss = round(price - stop_distance if side == "BUY" else price + stop_distance, digits)
+        expected_type = mt5.ORDER_TYPE_BUY_STOP if side == "BUY" else mt5.ORDER_TYPE_SELL_STOP
+        matching = [
+            order
+            for order in (mt5.orders_get(symbol=symbol) or [])
+            if int(getattr(order, "magic", 0) or 0) == TRADE_MAGIC and int(getattr(order, "type", -1)) == expected_type
+        ]
+        ticket = None
+        broker_status = "LEVEL_SAVED"
+        broker_message = "Trigger saved. Pending order will use this level when placed."
+        if matching:
+            order = matching[0]
+            ticket = int(getattr(order, "ticket", 0) or 0)
+            request = {
+                "action": mt5.TRADE_ACTION_MODIFY,
+                "order": ticket,
+                "price": price,
+                "sl": stop_loss,
+                "tp": float(getattr(order, "tp", 0.0) or 0.0),
+                "type_time": int(getattr(order, "type_time", mt5.ORDER_TIME_GTC)),
+                "expiration": int(getattr(order, "time_expiration", 0) or 0),
+            }
+            response = mt5.order_send(request)
+            data = response._asdict() if response is not None and hasattr(response, "_asdict") else {}
+            if int(data.get("retcode", 0)) != getattr(mt5, "TRADE_RETCODE_DONE", 10009):
+                raise RuntimeError(str(data.get("comment") or mt5.last_error()))
+            broker_status = "ORDER_MODIFIED"
+            broker_message = f"MT5 {side} STOP #{ticket} updated."
+        column = "buy_trigger_override" if side == "BUY" else "sell_trigger_override"
+        today = now_ist().date().isoformat()
+        runtime = connection.execute("SELECT last_signal_json FROM runtime WHERE id = 1").fetchone()
+        try:
+            last_signal = json.loads(runtime["last_signal_json"] or "{}")
+        except Exception:
+            last_signal = {}
+        last_signal["buy_trigger" if side == "BUY" else "sell_trigger"] = price
+        last_signal["trigger_override_active"] = True
+        last_signal["level_update"] = {"side": side, "status": broker_status, "message": broker_message, "ticket": ticket, "price": price, "stop_loss": stop_loss}
+        with connection:
+            connection.execute(
+                f"UPDATE runtime SET {column} = ?, trigger_override_day = ?, last_signal_json = ? WHERE id = 1",
+                (price, today, json.dumps(last_signal, separators=(",", ":"))),
+            )
+        first_distance = distance_to_points(strategy["first_trail_profit"], strategy["first_trail_profit_unit"], price)
+        second_distance = distance_to_points(strategy["second_trail_profit"], strategy["second_trail_profit_unit"], price)
+        lock_distance = distance_to_points(strategy["first_trail_lock_loss"], strategy["first_trail_lock_loss_unit"], price)
+        return {
+            "status": broker_status,
+            "message": broker_message,
+            "side": side,
+            "ticket": ticket,
+            "price": price,
+            "stop_loss": stop_loss,
+            "first_target": price + first_distance if side == "BUY" else price - first_distance,
+            "first_lock": price + lock_distance if side == "BUY" else price - lock_distance,
+            "second_target": price + first_distance + second_distance if side == "BUY" else price - first_distance - second_distance,
+        }
+    finally:
+        mt5.shutdown()
+
+
 def maybe_execute_live_trade(
     connection: sqlite3.Connection,
     strategy: dict[str, Any],
@@ -908,7 +1433,8 @@ def execute_mt5_order(
             raise RuntimeError(f"No live tick returned for {symbol}.")
         order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
         price = float(tick.ask if side == "BUY" else tick.bid)
-        stop_loss = float(signal.get("stop_loss") or 0.0)
+        stop_distance = distance_to_points(strategy["stop_points"], strategy["stop_points_unit"], price)
+        stop_loss = price - stop_distance if side == "BUY" else price + stop_distance
         target_points = float(strategy.get("target_points") or 0.0)
         take_profit = 0.0
         if target_points > 0:
@@ -999,6 +1525,50 @@ def command_status(connection: sqlite3.Connection, _: dict[str, Any]) -> dict[st
     return {"ok": True, **runtime_state(connection)}
 
 
+def command_chart(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    strategy_id = str((payload or {}).get("strategy_id") or "")
+    if strategy_id:
+        row = connection.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+    else:
+        runtime = connection.execute("SELECT active_strategy_id FROM runtime WHERE id = 1").fetchone()
+        row = connection.execute("SELECT * FROM strategies WHERE id = ?", (runtime["active_strategy_id"],)).fetchone()
+    if row is None:
+        raise ValueError("Active strategy not found.")
+    strategy = row_to_strategy(row)
+    if mt5 is None or not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error() if mt5 else 'package unavailable'}")
+    try:
+        symbol = strategy["symbol"]
+        if not mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"Symbol not available in MT5 Market Watch: {symbol}")
+        requested = max(30, min(int((payload or {}).get("count") or 90), 180))
+        rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe(strategy["timeframe"]), 0, requested)
+        if rates is None or len(rates) == 0:
+            raise RuntimeError(f"No live chart candles returned for {symbol}.")
+        candles = []
+        for item in rates:
+            candle_time = datetime.fromtimestamp(int(item["time"]), tz=UTC).astimezone(IST)
+            candles.append({
+                "time": candle_time.isoformat(),
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+                "tick_volume": int(item["tick_volume"]),
+            })
+        tick = mt5.symbol_info_tick(symbol)
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "timeframe": strategy["timeframe"],
+            "candles": candles,
+            "live_price": float((getattr(tick, "last", 0.0) or getattr(tick, "bid", 0.0)) if tick else candles[-1]["close"]),
+            "server_time": now_ist().isoformat(),
+        }
+    finally:
+        mt5.shutdown()
+
+
 def command_strategies(connection: sqlite3.Connection, _: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "strategies": list_strategies(connection)}
 
@@ -1046,6 +1616,41 @@ def command_strategy_delete(connection: sqlite3.Connection, payload: dict[str, A
 def command_control(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action") or "").lower()
     strategy_id = str(payload.get("strategy_id") or payload.get("id") or "")
+    if action == "update_level":
+        if not strategy_id:
+            strategy_id = str(connection.execute("SELECT active_strategy_id FROM runtime WHERE id = 1").fetchone()["active_strategy_id"] or "")
+        row = connection.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+        if row is None:
+            raise ValueError("Strategy not found.")
+        update = update_pending_trigger(connection, row_to_strategy(row), str(payload.get("side") or ""), float(payload.get("price") or 0))
+        return {"ok": True, "level_update": update, **runtime_state(connection)}
+    if action == "reset_levels":
+        if not strategy_id:
+            strategy_id = str(connection.execute("SELECT active_strategy_id FROM runtime WHERE id = 1").fetchone()["active_strategy_id"] or "")
+        row = connection.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+        if row is None:
+            raise ValueError("Strategy not found.")
+        strategy = row_to_strategy(row)
+        with connection:
+            connection.execute(
+                """
+                UPDATE runtime
+                SET buy_trigger_override = NULL, sell_trigger_override = NULL, trigger_override_day = ''
+                WHERE id = 1
+                """
+            )
+        cancellation = cancel_algo_pending_orders(strategy["symbol"], "Reset strategy levels")
+        result = scan_signal(connection, strategy_id)
+        return {
+            "ok": True,
+            "level_reset": {
+                "status": "STRATEGY_LEVELS_RESTORED",
+                "message": "Manual levels cleared. Strategy-calculated levels are active.",
+                "cancellation": cancellation,
+            },
+            "last_signal": result,
+            **runtime_state(connection),
+        }
     if action == "start":
         if not strategy_id:
             row = connection.execute("SELECT id FROM strategies ORDER BY updated_at DESC LIMIT 1").fetchone()
@@ -1054,6 +1659,12 @@ def command_control(connection: sqlite3.Connection, payload: dict[str, Any]) -> 
             strategy_id = row["id"]
         if connection.execute("SELECT 1 FROM strategies WHERE id = ?", (strategy_id,)).fetchone() is None:
             raise ValueError("Strategy not found.")
+        previous = connection.execute(
+            "SELECT s.symbol FROM runtime r LEFT JOIN strategies s ON s.id = r.active_strategy_id WHERE r.id = 1"
+        ).fetchone()
+        next_symbol = connection.execute("SELECT symbol FROM strategies WHERE id = ?", (strategy_id,)).fetchone()["symbol"]
+        if previous and previous["symbol"] and previous["symbol"] != next_symbol:
+            cancel_algo_pending_orders(previous["symbol"], "Strategy changed")
         with connection:
             connection.execute(
                 """
@@ -1066,6 +1677,11 @@ def command_control(connection: sqlite3.Connection, payload: dict[str, Any]) -> 
             )
         return {"ok": True, **runtime_state(connection)}
     if action == "stop":
+        active = connection.execute(
+            "SELECT s.symbol FROM runtime r LEFT JOIN strategies s ON s.id = r.active_strategy_id WHERE r.id = 1"
+        ).fetchone()
+        if active and active["symbol"]:
+            cancel_algo_pending_orders(active["symbol"], "Algo stopped")
         with connection:
             connection.execute(
                 "UPDATE runtime SET running = 0, stopped_at = ?, algo_status = 'Algo stopped.' WHERE id = 1",
@@ -1127,6 +1743,7 @@ def command_symbols(_: sqlite3.Connection, payload: dict[str, Any]) -> dict[str,
 
 COMMANDS = {
     "status": command_status,
+    "chart": command_chart,
     "strategies": command_strategies,
     "strategy_create": command_strategy_create,
     "strategy_update": command_strategy_update,

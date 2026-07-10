@@ -73,12 +73,10 @@ function broadcast(wss, payload) {
 }
 
 async function loadLiveState({ check = false } = {}) {
-  const status = await runWorker("status");
-  if (!check || !status.running || !status.active_strategy_id) return status;
+  if (!check) return runWorker("status");
   try {
     return await runWorker("control", {
       action: "check",
-      strategy_id: status.active_strategy_id,
     });
   } catch {
     return await runWorker("status");
@@ -94,15 +92,18 @@ const server = createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ noServer: true });
-let quoteTimer = null;
-let signalTimer = null;
+const FAST_ACTION_INTERVAL_MS = 100;
+const IDLE_REFRESH_INTERVAL_MS = 2000;
+let liveTimer = null;
 let liveCheckRunning = false;
+let lastKnownRunning = false;
 
 async function publishState(options) {
   if (liveCheckRunning) return;
   liveCheckRunning = true;
   try {
     const state = await loadLiveState(options);
+    lastKnownRunning = Boolean(state?.running);
     broadcast(wss, { type: "state", state });
   } catch (error) {
     broadcast(wss, {
@@ -114,35 +115,34 @@ async function publishState(options) {
   }
 }
 
+function scheduleLiveTick(delay = 0) {
+  if (liveTimer || !wss.clients.size) return;
+  liveTimer = setTimeout(async () => {
+    liveTimer = null;
+    await publishState({ check: lastKnownRunning });
+    scheduleLiveTick(lastKnownRunning ? FAST_ACTION_INTERVAL_MS : IDLE_REFRESH_INTERVAL_MS);
+  }, delay);
+}
+
 function startLiveTimer() {
-  if (!quoteTimer) {
-    quoteTimer = setInterval(() => {
-      void publishState();
-    }, 2000);
-  }
-  if (!signalTimer) {
-    signalTimer = setInterval(() => {
-      void publishState({ check: true });
-    }, 15000);
-  }
+  scheduleLiveTick();
 }
 
 function stopLiveTimerIfIdle() {
   if (wss.clients.size) return;
-  if (quoteTimer) {
-    clearInterval(quoteTimer);
-    quoteTimer = null;
-  }
-  if (signalTimer) {
-    clearInterval(signalTimer);
-    signalTimer = null;
+  if (liveTimer) {
+    clearTimeout(liveTimer);
+    liveTimer = null;
   }
 }
 
 function runImmediateSignalCheck() {
-  setTimeout(() => {
-    void publishState({ check: true });
-  }, 500);
+  lastKnownRunning = true;
+  if (liveTimer) {
+    clearTimeout(liveTimer);
+    liveTimer = null;
+  }
+  scheduleLiveTick();
 }
 
 wss.on("connection", (socket) => {
