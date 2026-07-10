@@ -8,6 +8,8 @@
     "build": "cross-env NEXT_TELEMETRY_DISABLED=1 next build",
     "build:vps": "cross-env LOW_MEMORY_BUILD=1 NEXT_TELEMETRY_DISABLED=1 NODE_OPTIONS=--max-old-space-size=1536 next build",
     "start": "cross-env NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 node server.mjs",
+    "setup": "npm install --no-audit --no-fund && npm run build",
+    "setup:vps": "npm install --no-audit --no-fund && npm run build:vps",
     "doctor": "node scripts/vps-doctor.mjs"
   },
   "dependencies": {

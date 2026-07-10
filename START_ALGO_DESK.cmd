@@ -202,6 +202,97 @@ function Test-PythonWorker {
     }
 }
 
+function Ensure-NodeModules {
+    $nextModule = Join-Path $root "node_modules\next"
+    if (Test-Path -LiteralPath $nextModule) {
+        Write-Step "Node dependencies are ready."
+        return
+    }
+
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) {
+        $npm = Get-Command npm -ErrorAction SilentlyContinue
+    }
+    if (-not $npm) {
+        throw "npm was not found. Install Node.js LTS from https://nodejs.org , then run: npm install"
+    }
+
+    $packageJson = Join-Path $root "package.json"
+    if (-not (Test-Path -LiteralPath $packageJson)) {
+        throw "package.json was not found: $packageJson"
+    }
+
+    Write-Step "node_modules is missing. Running npm install (first run can take a few minutes)..."
+    Push-Location -LiteralPath $root
+    try {
+        & $npm.Source install --no-audit --no-fund
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm install failed in: $root"
+        }
+    } finally {
+        Pop-Location
+    }
+
+    if (-not (Test-Path -LiteralPath $nextModule)) {
+        throw "npm install finished but package 'next' is still missing. Run 'npm install' manually in: $root"
+    }
+
+    Write-Step "Node dependencies installed."
+}
+
+function Ensure-ProductionBuild {
+    $nextDir = Join-Path $root ".next"
+    if (Test-Path -LiteralPath $nextDir) {
+        Write-Step "Production build is ready."
+        return
+    }
+
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) {
+        $npm = Get-Command npm -ErrorAction SilentlyContinue
+    }
+    if (-not $npm) {
+        throw "npm was not found. Install Node.js LTS from https://nodejs.org"
+    }
+
+    Write-Step "First run: building frontend (5-15 min on VPS — progress will show below)..."
+    Write-Host ""
+    Push-Location -LiteralPath $root
+    try {
+        $env:NEXT_TELEMETRY_DISABLED = "1"
+        & $npm.Source run build
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm run build failed in: $root"
+        }
+    } finally {
+        Pop-Location
+    }
+    Write-Host ""
+    Write-Step "Production build complete."
+}
+
+function Show-ServerLogSnippet {
+    param(
+        [string]$OutPath,
+        [string]$ErrPath,
+        [int]$TailLines = 8
+    )
+
+    foreach ($path in @($OutPath, $ErrPath)) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            continue
+        }
+        $name = Split-Path -Leaf $path
+        $lines = @(Get-Content -LiteralPath $path -Tail $TailLines -ErrorAction SilentlyContinue)
+        if ($lines.Count -eq 0) {
+            continue
+        }
+        Write-Host ""
+        Write-Host ("  --- " + $name + " ---") -ForegroundColor DarkGray
+        $lines | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor DarkGray }
+    }
+}
+
 function Start-Server {
     $node = Get-Command node.exe -ErrorAction Stop
     if (-not (Test-Path -LiteralPath $serverFile)) {
@@ -221,10 +312,14 @@ function Start-Server {
 
     $previousHost = $env:HOST
     $previousPort = $env:PORT
+    $previousNodeEnv = $env:NODE_ENV
+    $previousTelemetry = $env:NEXT_TELEMETRY_DISABLED
     $env:HOST = $hostName
     $env:PORT = [string]$port
+    $env:NODE_ENV = "production"
+    $env:NEXT_TELEMETRY_DISABLED = "1"
     try {
-        Write-Step "Starting the frontend/backend server: node server.mjs"
+        Write-Step "Starting server in production mode: node server.mjs"
         return Start-Process `
             -FilePath $node.Source `
             -ArgumentList @("`"$serverFile`"") `
@@ -244,32 +339,55 @@ function Start-Server {
         } else {
             $env:PORT = $previousPort
         }
+        if ($null -eq $previousNodeEnv) {
+            Remove-Item Env:\NODE_ENV -ErrorAction SilentlyContinue
+        } else {
+            $env:NODE_ENV = $previousNodeEnv
+        }
+        if ($null -eq $previousTelemetry) {
+            Remove-Item Env:\NEXT_TELEMETRY_DISABLED -ErrorAction SilentlyContinue
+        } else {
+            $env:NEXT_TELEMETRY_DISABLED = $previousTelemetry
+        }
     }
 }
 
 function Wait-ForServer {
     param(
         [string]$Url,
-        [int]$TimeoutSeconds = 90
+        [int]$TimeoutSeconds = 300,
+        [string]$OutLog,
+        [string]$ErrLog
     )
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $started = Get-Date
+    $deadline = $started.AddSeconds($TimeoutSeconds)
+    $lastStatusAt = [datetime]::MinValue
+
     while ((Get-Date) -lt $deadline) {
         if ($script:serverProcess) {
             $script:serverProcess.Refresh()
             if ($script:serverProcess.HasExited) {
+                Write-Step "Server process stopped early (exit code $($script:serverProcess.ExitCode))."
                 return $false
             }
         }
 
+        $elapsed = [int]((Get-Date) - $started).TotalSeconds
+        if (((Get-Date) - $lastStatusAt).TotalSeconds -ge 10) {
+            Write-Step "Still starting... ${elapsed}s / ${TimeoutSeconds}s"
+            Show-ServerLogSnippet -OutPath $OutLog -ErrPath $ErrLog
+            $lastStatusAt = Get-Date
+        }
+
         try {
-            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
                 return $true
             }
         } catch {
         }
-        Start-Sleep -Milliseconds 700
+        Start-Sleep -Milliseconds 1000
     }
 
     return $false
@@ -378,14 +496,24 @@ try {
 
     Ensure-Mt5Open
     Test-PythonWorker
+    Ensure-NodeModules
+    Ensure-ProductionBuild
 
     $script:serverProcess = Start-Server
     Start-CleanupWatcher -ServerPid ([int]$script:serverProcess.Id)
 
-    if (-not (Wait-ForServer -Url $frontendUrl -TimeoutSeconds 90)) {
+    Write-Step "Waiting for server at $frontendUrl ..."
+    Write-Step "Logs: $serverOut"
+
+    if (-not (Wait-ForServer -Url $frontendUrl -TimeoutSeconds 300 -OutLog $serverOut -ErrLog $serverErr)) {
         Write-Step "The server did not become ready. Error log:"
         if (Test-Path -LiteralPath $serverErr) {
-            Get-Content -LiteralPath $serverErr -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            $errorLog = Get-Content -LiteralPath $serverErr -Tail 40 -ErrorAction SilentlyContinue
+            $errorLog | ForEach-Object { Write-Host $_ }
+            if ($errorLog -match "ERR_MODULE_NOT_FOUND|Cannot find package 'next'") {
+                Write-Host ""
+                Write-Step "Fix: open CMD in the project folder and run: npm install"
+            }
         }
         throw "Server failed to start on $frontendUrl"
     }
