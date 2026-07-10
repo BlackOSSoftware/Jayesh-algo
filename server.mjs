@@ -4,14 +4,20 @@ import { spawn } from "node:child_process";
 import { parse } from "node:url";
 import next from "next";
 import { WebSocket, WebSocketServer } from "ws";
+import { resolvePythonBin } from "./lib/resolve-python.mjs";
 
 const dev = process.env.NODE_ENV !== "production";
-const hostname = process.env.HOST || "127.0.0.1";
+const hostname =
+  process.env.HOST || (dev ? "127.0.0.1" : "0.0.0.0");
 const port = Number(process.env.PORT || 3000);
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 const workerPath = path.join(process.cwd(), "python", "algo_worker.py");
-const pythonBin = process.env.ALGO_PYTHON || "python";
+const pythonBin = resolvePythonBin();
+
+console.log(`> Algo Desk starting (${dev ? "development" : "production"})`);
+console.log(`> Python: ${pythonBin}`);
+console.log(`> Preparing Next.js (first start on VPS can take 2-5 minutes, please wait)...`);
 
 function runWorker(command, payload) {
   return new Promise((resolve, reject) => {
@@ -80,6 +86,7 @@ async function loadLiveState({ check = false } = {}) {
 }
 
 await app.prepare();
+console.log(`> Next.js ready. Binding http://${hostname}:${port}`);
 
 const server = createServer((req, res) => {
   const parsedUrl = parse(req.url || "", true);
