@@ -255,14 +255,18 @@ function Ensure-ProductionBuild {
         throw "npm was not found. Install Node.js LTS from https://nodejs.org"
     }
 
-    Write-Step "First run: building frontend (5-15 min on VPS — progress will show below)..."
+    Write-Step "First run: building frontend (5-15 min on slow PCs - progress below)..."
     Write-Host ""
     Push-Location -LiteralPath $root
     try {
         $env:NEXT_TELEMETRY_DISABLED = "1"
         & $npm.Source run build
         if ($LASTEXITCODE -ne 0) {
-            throw "npm run build failed in: $root"
+            Write-Step "Normal build failed. Trying low-memory build ..."
+            & $npm.Source run build:vps
+            if ($LASTEXITCODE -ne 0) {
+                throw "npm run build failed in: $root"
+            }
         }
     } finally {
         Pop-Location
@@ -310,46 +314,14 @@ function Start-Server {
     Stop-ProcessesByCommandLineText -Text $serverFile -ExcludeIds @($PID)
     Stop-NodeLikePortProcesses -LocalPort $port
 
-    $previousHost = $env:HOST
-    $previousPort = $env:PORT
-    $previousNodeEnv = $env:NODE_ENV
-    $previousTelemetry = $env:NEXT_TELEMETRY_DISABLED
-    $env:HOST = $hostName
-    $env:PORT = [string]$port
-    $env:NODE_ENV = "production"
-    $env:NEXT_TELEMETRY_DISABLED = "1"
-    try {
-        Write-Step "Starting server in production mode: node server.mjs"
-        return Start-Process `
-            -FilePath $node.Source `
-            -ArgumentList @("`"$serverFile`"") `
-            -WorkingDirectory $root `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $serverOut `
-            -RedirectStandardError $serverErr `
-            -PassThru
-    } finally {
-        if ($null -eq $previousHost) {
-            Remove-Item Env:\HOST -ErrorAction SilentlyContinue
-        } else {
-            $env:HOST = $previousHost
-        }
-        if ($null -eq $previousPort) {
-            Remove-Item Env:\PORT -ErrorAction SilentlyContinue
-        } else {
-            $env:PORT = $previousPort
-        }
-        if ($null -eq $previousNodeEnv) {
-            Remove-Item Env:\NODE_ENV -ErrorAction SilentlyContinue
-        } else {
-            $env:NODE_ENV = $previousNodeEnv
-        }
-        if ($null -eq $previousTelemetry) {
-            Remove-Item Env:\NEXT_TELEMETRY_DISABLED -ErrorAction SilentlyContinue
-        } else {
-            $env:NEXT_TELEMETRY_DISABLED = $previousTelemetry
-        }
-    }
+    $launchCmd = "set NODE_ENV=production&& set HOST=$hostName&& set PORT=$port&& set NEXT_TELEMETRY_DISABLED=1&& node `"$serverFile`" >`"$serverOut`" 2>`"$serverErr`""
+    Write-Step "Starting server in production mode: node server.mjs"
+    return Start-Process `
+        -FilePath "cmd.exe" `
+        -ArgumentList @("/c", $launchCmd) `
+        -WorkingDirectory $root `
+        -WindowStyle Hidden `
+        -PassThru
 }
 
 function Wait-ForServer {
