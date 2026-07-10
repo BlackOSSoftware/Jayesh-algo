@@ -135,15 +135,17 @@ function Stop-OrphanNextBuilds {
 }
 
 function Repair-NextCache {
-    $cachePath = Join-Path $root ".next"
+    # Only clear the webpack/cache folder. Never delete the whole .next build
+    # (that removes BUILD_ID and breaks production start).
+    $cachePath = Join-Path $root ".next\cache"
     if (-not (Test-Path -LiteralPath $cachePath)) { return }
     $resolvedRoot = [IO.Path]::GetFullPath($root).TrimEnd('\')
     $resolvedCache = [IO.Path]::GetFullPath($cachePath)
     if (-not $resolvedCache.StartsWith($resolvedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to clean an unsafe Next.js cache path: $resolvedCache"
     }
-    Write-Step "Cleaning the generated Next.js cache for a reliable startup..."
-    Remove-Item -LiteralPath $resolvedCache -Recurse -Force -ErrorAction Stop
+    Write-Step "Cleaning the Next.js cache folder for a reliable startup..."
+    Remove-Item -LiteralPath $resolvedCache -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Ensure-NodeEnvironment {
@@ -401,8 +403,8 @@ function Ensure-NodeModules {
 }
 
 function Ensure-ProductionBuild {
-    $nextDir = Join-Path $root ".next"
-    if (Test-Path -LiteralPath $nextDir) {
+    $buildId = Join-Path $root ".next\BUILD_ID"
+    if (Test-Path -LiteralPath $buildId) {
         Write-Step "Production build is ready."
         return
     }
@@ -432,6 +434,9 @@ function Ensure-ProductionBuild {
         Pop-Location
     }
     Write-Host ""
+    if (-not (Test-Path -LiteralPath $buildId)) {
+        throw "Build finished but .next\BUILD_ID is still missing."
+    }
     Write-Step "Production build complete."
 }
 
@@ -443,6 +448,9 @@ function Show-ServerLogSnippet {
     )
 
     foreach ($path in @($OutPath, $ErrPath)) {
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            continue
+        }
         if (-not (Test-Path -LiteralPath $path)) {
             continue
         }
@@ -529,7 +537,7 @@ function Start-ServerReliably {
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         Write-Step "Server startup attempt $attempt of 2..."
         $script:serverProcess = Start-Server
-        if (Wait-ForServer -Url $frontendUrl -TimeoutSeconds 120) {
+        if (Wait-ForServer -Url $frontendUrl -TimeoutSeconds 120 -OutLog $serverOut -ErrLog $serverErr) {
             return $true
         }
 
@@ -538,13 +546,19 @@ function Start-ServerReliably {
             Stop-ProcessTree -ProcessId ([int]$script:serverProcess.Id)
             $script:serverProcess = $null
         }
-        if (Test-Path -LiteralPath $serverErr) {
+        if (-not [string]::IsNullOrWhiteSpace($serverErr) -and (Test-Path -LiteralPath $serverErr)) {
             Get-Content -LiteralPath $serverErr -Tail 20 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
         }
         if ($attempt -lt 2) {
             Write-Step "Repairing generated files before automatic retry..."
             Stop-OrphanNextBuilds
             Repair-NextCache
+            # If production build is missing/corrupt, rebuild before retry
+            $buildId = Join-Path $root ".next\BUILD_ID"
+            if (-not (Test-Path -LiteralPath $buildId)) {
+                Write-Step "Production build missing after cleanup. Rebuilding..."
+                Ensure-ProductionBuild
+            }
         }
     }
     return $false
@@ -698,9 +712,14 @@ try {
     Write-Host ""
     Write-Host ("[Algo Desk] Error: " + $_.Exception.Message) -ForegroundColor Red
     Write-Host ""
-    Write-Host "This window will remain open for 20 seconds so you can read the error." -ForegroundColor Yellow
     Write-Host ("Detailed logs: " + $serverErr)
-    Start-Sleep -Seconds 20
+    Write-Host ""
+    Write-Host "Press any key to close this window..." -ForegroundColor Yellow
+    try {
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    } catch {
+        Start-Sleep -Seconds 30
+    }
     exit 1
 } finally {
     Stop-AllStartedStuff
