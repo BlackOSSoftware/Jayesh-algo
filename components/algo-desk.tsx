@@ -186,33 +186,33 @@ type AlgoState = {
 
 const emptyStrategy: Strategy = {
   id: "",
-  name: "BTCUSD# M5 breakout",
+  name: "",
   data_source: "MT5",
-  symbol: "BTCUSD#",
-  timeframe: "M5",
-  trail_timeframe: "M5",
-  entry_pattern: "BOTH",
-  range_start: "08:15",
-  range_end: "09:30",
-  session_start: "09:30",
-  entry_cutoff: "18:00",
-  session_end: "19:30",
-  entry_buffer_pct: 0.05,
+  symbol: "",
+  timeframe: "",
+  trail_timeframe: "",
+  entry_pattern: "",
+  range_start: "",
+  range_end: "",
+  session_start: "",
+  entry_cutoff: "",
+  session_end: "",
+  entry_buffer_pct: "" as unknown as number,
   entry_buffer_points: 0,
-  stop_points: 400,
+  stop_points: "" as unknown as number,
   stop_points_unit: "POINTS",
-  first_trail_profit: 400,
+  first_trail_profit: "" as unknown as number,
   first_trail_profit_unit: "POINTS",
-  first_trail_lock_loss: 200,
+  first_trail_lock_loss: "" as unknown as number,
   first_trail_lock_loss_unit: "POINTS",
-  second_trail_profit: 700,
+  second_trail_profit: "" as unknown as number,
   second_trail_profit_unit: "POINTS",
-  volume: 1,
+  volume: "" as unknown as number,
   target_points: 0,
   max_trades_per_day: 1,
   max_open_positions: 1,
   live_trading_enabled: false,
-  execution_mode: "PENDING_BEFORE_SIGNAL",
+  execution_mode: "" as Strategy["execution_mode"],
 };
 
 const timeframes = ["M1", "M2", "M3", "M4", "M5", "M10", "M15", "M30", "H1", "H4"];
@@ -1971,6 +1971,7 @@ function SettingsView({
             </Field>
             <Field icon={<Clock3 />} label="Entry Candle Timeframe">
               <select className="input" value={form.timeframe} onChange={(event) => onField("timeframe", event.target.value)}>
+                <option value="">Select timeframe</option>
                 {timeframes.map((timeframe) => (
                   <option key={timeframe}>{timeframe}</option>
                 ))}
@@ -1978,6 +1979,7 @@ function SettingsView({
             </Field>
             <Field icon={<Clock3 />} label="Second Target Exit Trail Candle Timeframe">
               <select className="input" value={form.trail_timeframe} onChange={(event) => onField("trail_timeframe", event.target.value)}>
+                <option value="">Select timeframe</option>
                 {timeframes.map((timeframe) => (
                   <option key={timeframe}>{timeframe}</option>
                 ))}
@@ -1985,6 +1987,7 @@ function SettingsView({
             </Field>
             <Field icon={<ArrowRightLeft />} label="Entry Pattern">
               <select className="input" value={form.entry_pattern} onChange={(event) => onField("entry_pattern", event.target.value)}>
+                <option value="">Select pattern</option>
                 {patterns.map(([value, label]) => (
                   <option key={value} value={value}>
                     {label}

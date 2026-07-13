@@ -482,14 +482,30 @@ function Start-Server {
     Stop-ProcessesByCommandLineText -Text $serverFile -ExcludeIds @($PID)
     Stop-NodeLikePortProcesses -LocalPort $port
 
-    $launchCmd = "set NODE_ENV=production&& set HOST=$hostName&& set PORT=$port&& set NEXT_TELEMETRY_DISABLED=1&& node `"$serverFile`" >`"$serverOut`" 2>`"$serverErr`""
     Write-Step "Starting server in production mode: node server.mjs"
-    return Start-Process `
-        -FilePath "cmd.exe" `
-        -ArgumentList @("/c", $launchCmd) `
-        -WorkingDirectory $root `
-        -WindowStyle Hidden `
-        -PassThru
+    $previousNodeEnv = $env:NODE_ENV
+    $previousHost = $env:HOST
+    $previousPort = $env:PORT
+    $previousTelemetry = $env:NEXT_TELEMETRY_DISABLED
+    try {
+        $env:NODE_ENV = "production"
+        $env:HOST = $hostName
+        $env:PORT = [string]$port
+        $env:NEXT_TELEMETRY_DISABLED = "1"
+        return Start-Process `
+            -FilePath $node.Source `
+            -ArgumentList @("`"$serverFile`"") `
+            -WorkingDirectory $root `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $serverOut `
+            -RedirectStandardError $serverErr `
+            -PassThru
+    } finally {
+        if ($null -eq $previousNodeEnv) { Remove-Item Env:\NODE_ENV -ErrorAction SilentlyContinue } else { $env:NODE_ENV = $previousNodeEnv }
+        if ($null -eq $previousHost) { Remove-Item Env:\HOST -ErrorAction SilentlyContinue } else { $env:HOST = $previousHost }
+        if ($null -eq $previousPort) { Remove-Item Env:\PORT -ErrorAction SilentlyContinue } else { $env:PORT = $previousPort }
+        if ($null -eq $previousTelemetry) { Remove-Item Env:\NEXT_TELEMETRY_DISABLED -ErrorAction SilentlyContinue } else { $env:NEXT_TELEMETRY_DISABLED = $previousTelemetry }
+    }
 }
 
 function Wait-ForServer {
@@ -522,6 +538,17 @@ function Wait-ForServer {
         try {
             $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                # A different app may already own the port and answer this request
+                # while our Node process is still failing with EADDRINUSE. Confirm
+                # that the process we started survives before declaring readiness.
+                Start-Sleep -Milliseconds 750
+                if ($script:serverProcess) {
+                    $script:serverProcess.Refresh()
+                    if ($script:serverProcess.HasExited) {
+                        Write-Step "Server process stopped during readiness validation (exit code $($script:serverProcess.ExitCode))."
+                        return $false
+                    }
+                }
                 return $true
             }
         } catch {
@@ -533,7 +560,6 @@ function Wait-ForServer {
 }
 
 function Start-ServerReliably {
-    Repair-NextCache
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         Write-Step "Server startup attempt $attempt of 2..."
         $script:serverProcess = Start-Server
@@ -553,12 +579,7 @@ function Start-ServerReliably {
             Write-Step "Repairing generated files before automatic retry..."
             Stop-OrphanNextBuilds
             Repair-NextCache
-            # If production build is missing/corrupt, rebuild before retry
-            $buildId = Join-Path $root ".next\BUILD_ID"
-            if (-not (Test-Path -LiteralPath $buildId)) {
-                Write-Step "Production build missing after cleanup. Rebuilding..."
-                Ensure-ProductionBuild
-            }
+            Ensure-ProductionBuild
         }
     }
     return $false
@@ -603,9 +624,7 @@ function Start-CleanupWatcher {
     $configJson = @{
         ParentPid = $PID
         ServerPid = $ServerPid
-        Port = $port
         ChromeProfile = $chromeProfile
-        ServerFile = $serverFile
     } | ConvertTo-Json -Compress
     $configB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($configJson))
 
@@ -619,36 +638,15 @@ function Stop-ProcessTree {
     foreach (`$child in `$children) { Stop-ProcessTree -ProcessId ([int]`$child.ProcessId) }
     Stop-Process -Id `$ProcessId -Force -ErrorAction SilentlyContinue
 }
-function Stop-ByCommandLineText {
-    param([string]`$Text)
-    if ([string]::IsNullOrWhiteSpace(`$Text)) { return }
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        `$_.CommandLine -and `$_.CommandLine.IndexOf(`$Text, [StringComparison]::OrdinalIgnoreCase) -ge 0
-    } | ForEach-Object {
-        if ([int]`$_.ProcessId -ne `$PID -and [int]`$_.ProcessId -ne [int]`$config.ParentPid) {
-            Stop-ProcessTree -ProcessId ([int]`$_.ProcessId)
-        }
-    }
-}
-function Stop-PortProcesses {
-    param([int]`$LocalPort)
-    `$names = @('node', 'npm', 'cmd', 'powershell', 'pwsh')
-    Get-NetTCPConnection -LocalPort `$LocalPort -State Listen -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty OwningProcess -Unique |
-        ForEach-Object {
-            `$process = Get-Process -Id `$_ -ErrorAction SilentlyContinue
-            if (`$process -and (`$names -contains `$process.ProcessName.ToLowerInvariant())) {
-                Stop-ProcessTree -ProcessId ([int]`$process.Id)
-            }
-        }
-}
 while (Get-Process -Id ([int]`$config.ParentPid) -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 1
 }
 Stop-ProcessTree -ProcessId ([int]`$config.ServerPid)
-Stop-ByCommandLineText -Text ([string]`$config.ServerFile)
-Stop-ByCommandLineText -Text ([string]`$config.ChromeProfile)
-Stop-PortProcesses -LocalPort ([int]`$config.Port)
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    `$_.CommandLine -and `$_.CommandLine.IndexOf([string]`$config.ChromeProfile, [StringComparison]::OrdinalIgnoreCase) -ge 0
+} | ForEach-Object {
+    if ([int]`$_.ProcessId -ne `$PID) { Stop-ProcessTree -ProcessId ([int]`$_.ProcessId) }
+}
 "@
 
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($watcherSource))
@@ -661,9 +659,7 @@ function Stop-AllStartedStuff {
     if ($script:serverProcess) {
         Stop-ProcessTree -ProcessId ([int]$script:serverProcess.Id)
     }
-    Stop-ProcessesByCommandLineText -Text $serverFile -ExcludeIds @($PID)
     Stop-ProcessesByCommandLineText -Text $chromeProfile -ExcludeIds @($PID)
-    Stop-NodeLikePortProcesses -LocalPort $port
 }
 
 try {

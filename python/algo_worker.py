@@ -366,8 +366,6 @@ def upsert_strategy(connection: sqlite3.Connection, strategy: dict[str, Any]) ->
 
 def migrate_legacy(connection: sqlite3.Connection) -> None:
     existing_count = connection.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
-    if existing_count:
-        return
     if LEGACY_JSON.exists():
         try:
             legacy = json.loads(LEGACY_JSON.read_text(encoding="utf-8"))
@@ -376,6 +374,39 @@ def migrate_legacy(connection: sqlite3.Connection) -> None:
     else:
         legacy = {}
     strategies = legacy.get("strategies") or [DEFAULT_STRATEGY]
+
+    # A database may already contain a newly-created default strategy even
+    # though older saved strategies still exist in algo.json. Merge only
+    # missing legacy records so later SQLite edits are never overwritten.
+    if existing_count:
+        with connection:
+            for item in strategies:
+                strategy_id = str(item.get("id") or "")
+                if not strategy_id or connection.execute(
+                    "SELECT 1 FROM strategies WHERE id = ?", (strategy_id,)
+                ).fetchone():
+                    continue
+                imported = dict(item)
+                imported["name"] = f"{imported.get('symbol') or DEFAULT_STRATEGY['symbol']} {str(imported.get('timeframe') or 'M5').upper()} breakout"
+                upsert_strategy(connection, normalize_strategy(imported, strategy_id))
+
+            runtime = connection.execute(
+                "SELECT running, active_strategy_id FROM runtime WHERE id = 1"
+            ).fetchone()
+            saved_active = str(legacy.get("active_strategy_id") or "")
+            if (
+                runtime
+                and not runtime["running"]
+                and not runtime["active_strategy_id"]
+                and saved_active
+                and connection.execute("SELECT 1 FROM strategies WHERE id = ?", (saved_active,)).fetchone()
+            ):
+                connection.execute(
+                    "UPDATE runtime SET active_strategy_id = ?, last_error = '', algo_status = 'Saved strategy restored.' WHERE id = 1",
+                    (saved_active,),
+                )
+        return
+
     for item in strategies:
         upsert_strategy(connection, normalize_strategy(item, str(item.get("id") or "")))
     active = str(legacy.get("active_strategy_id") or "")
@@ -438,10 +469,10 @@ def migrate_legacy(connection: sqlite3.Connection) -> None:
 
 
 def init_db() -> sqlite3.Connection:
-    connection = connect()
-    with connection:
-        migrate_legacy(connection)
-    return connection
+    # SQLite is now the only source of truth. Do not recreate deleted/default
+    # strategies from the legacy JSON file; an empty database must stay empty
+    # until the user explicitly saves settings.
+    return connect()
 
 
 def list_strategies(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1575,10 +1606,11 @@ def command_strategies(connection: sqlite3.Connection, _: dict[str, Any]) -> dic
 
 def command_strategy_create(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
     strategy = normalize_strategy(payload)
+    strategy["updated_at"] = now_utc()
     with connection:
         upsert_strategy(connection, strategy)
         connection.execute(
-            "UPDATE runtime SET active_strategy_id = CASE WHEN active_strategy_id = '' THEN ? ELSE active_strategy_id END WHERE id = 1",
+            "UPDATE runtime SET active_strategy_id = CASE WHEN running = 0 THEN ? ELSE active_strategy_id END WHERE id = 1",
             (strategy["id"],),
         )
     return {"ok": True, "strategy": strategy}
@@ -1592,8 +1624,13 @@ def command_strategy_update(connection: sqlite3.Connection, payload: dict[str, A
     if current is None:
         raise ValueError("Strategy not found.")
     strategy = normalize_strategy({**row_to_strategy(current), **payload}, strategy_id)
+    strategy["updated_at"] = now_utc()
     with connection:
         upsert_strategy(connection, strategy)
+        connection.execute(
+            "UPDATE runtime SET active_strategy_id = CASE WHEN running = 0 THEN ? ELSE active_strategy_id END WHERE id = 1",
+            (strategy_id,),
+        )
     return {"ok": True, "strategy": strategy}
 
 
