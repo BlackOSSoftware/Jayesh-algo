@@ -24,7 +24,7 @@ $script:serverProcess = $null
 $script:pythonPath = $null
 
 function Write-Step {
-    param([string]$Message)
+    param([string]$Message) 
     Write-Host ("[Algo Desk] " + $Message)
 }
 

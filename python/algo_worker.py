@@ -181,8 +181,20 @@ def connect() -> sqlite3.Connection:
             status TEXT NOT NULL,
             payload_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS event_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            day_key TEXT NOT NULL,
+            level TEXT NOT NULL,
+            event TEXT NOT NULL,
+            strategy_id TEXT NOT NULL DEFAULT '',
+            symbol TEXT NOT NULL DEFAULT '',
+            message TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        );
         CREATE INDEX IF NOT EXISTS idx_signal_log_time ON signal_log(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_trade_log_time ON trade_log(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_event_log_day_time ON event_log(day_key, created_at DESC);
         """
     )
     ensure_column(connection, "strategies", "from_date", "TEXT NOT NULL DEFAULT '2026-06-01'")
@@ -202,6 +214,7 @@ def connect() -> sqlite3.Connection:
         VALUES (1, 0, 'Ready.')
         """
     )
+    prune_event_logs(connection)
     return connection
 
 
@@ -209,6 +222,40 @@ def ensure_column(connection: sqlite3.Connection, table: str, column: str, decla
     columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def prune_event_logs(connection: sqlite3.Connection) -> None:
+    today = now_ist().date().isoformat()
+    connection.execute("DELETE FROM event_log WHERE day_key != ?", (today,))
+
+
+def add_event_log(
+    connection: sqlite3.Connection,
+    level: str,
+    event: str,
+    message: str,
+    strategy: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    created_at = now_ist().isoformat()
+    day_key = created_at[:10]
+    data = payload or {}
+    connection.execute(
+        """
+        INSERT INTO event_log (created_at, day_key, level, event, strategy_id, symbol, message, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            created_at,
+            day_key,
+            str(level or "INFO").upper(),
+            str(event or "EVENT").upper(),
+            str((strategy or {}).get("id") or data.get("strategy_id") or ""),
+            str((strategy or {}).get("symbol") or data.get("symbol") or ""),
+            str(message or ""),
+            json.dumps(data, separators=(",", ":"), default=str),
+        ),
+    )
 
 
 def row_to_strategy(row: sqlite3.Row) -> dict[str, Any]:
@@ -481,6 +528,7 @@ def list_strategies(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def runtime_state(connection: sqlite3.Connection) -> dict[str, Any]:
+    prune_event_logs(connection)
     row = connection.execute("SELECT * FROM runtime WHERE id = 1").fetchone()
     last_signal = {}
     if row["last_signal_json"]:
@@ -502,9 +550,15 @@ def runtime_state(connection: sqlite3.Connection) -> dict[str, Any]:
         {**dict(item), "payload": json.loads(item["payload_json"] or "{}")}
         for item in connection.execute("SELECT * FROM trade_log ORDER BY created_at DESC LIMIT 50").fetchall()
     ]
+    events = [
+        {**dict(item), "payload": json.loads(item["payload_json"] or "{}")}
+        for item in connection.execute("SELECT * FROM event_log ORDER BY created_at DESC LIMIT 300").fetchall()
+    ]
     for item in signals:
         item.pop("payload_json", None)
     for item in trades:
+        item.pop("payload_json", None)
+    for item in events:
         item.pop("payload_json", None)
     return {
         "running": bool(row["running"]),
@@ -525,6 +579,7 @@ def runtime_state(connection: sqlite3.Connection) -> dict[str, Any]:
         "strategies": list_strategies(connection),
         "signal_log": signals,
         "trade_log": trades,
+        "event_log": events,
         "database": str(DB_FILE),
     }
 
@@ -770,7 +825,16 @@ def scan_signal(connection: sqlite3.Connection, strategy_id: str | None = None) 
     )
     result["position_action"] = manage_live_positions(connection, strategy, running, checked_at, session_right)
     if checked_at < range_right:
-        result.update({"message": "Range window is still forming."})
+        result.update(
+            {
+                "message": "Range window is still forming.",
+                "buy_trigger": None,
+                "sell_trigger": None,
+                "calculated_buy_trigger": None,
+                "calculated_sell_trigger": None,
+                "trigger_override_active": False,
+            }
+        )
         save_signal_result(connection, result)
         return result
     if checked_at < session_left:
@@ -909,6 +973,19 @@ def save_signal_result(connection: sqlite3.Connection, result: dict[str, Any]) -
                 result.get("message") or "",
                 json.dumps(result, separators=(",", ":")),
             ),
+        )
+        add_event_log(
+            connection,
+            "SIGNAL",
+            "SIGNAL_CROSSED",
+            f"{result.get('side')} trigger crossed at {result.get('entry_reference')}",
+            {"id": result.get("strategy_id") or "", "symbol": result.get("symbol") or ""},
+            {
+                "side": result.get("side"),
+                "entry_reference": result.get("entry_reference"),
+                "stop_loss": result.get("stop_loss"),
+                "trigger_candle_time": result.get("trigger_candle_time"),
+            },
         )
 
 
@@ -1069,6 +1146,14 @@ def log_open_position(connection: sqlite3.Connection, strategy: dict[str, Any], 
             """,
             (now_ist().isoformat(), strategy["id"], strategy["symbol"], side, payload["entry_price"], payload["stop_loss"], "POSITION_OPEN", json.dumps(payload, separators=(",", ":"))),
         )
+        add_event_log(
+            connection,
+            "TRADE",
+            "POSITION_OPEN",
+            f"{side} position open #{ticket} entry {payload['entry_price']} SL {payload['stop_loss']}",
+            strategy,
+            payload,
+        )
 
 
 def modify_position_stop(position: Any, stop_loss: float, reason: str, digits: int) -> dict[str, Any]:
@@ -1084,7 +1169,7 @@ def modify_position_stop(position: Any, stop_loss: float, reason: str, digits: i
     response = mt5.order_send(request)
     data = response._asdict() if response is not None and hasattr(response, "_asdict") else {}
     ok = int(data.get("retcode", 0)) == getattr(mt5, "TRADE_RETCODE_DONE", 10009)
-    return {"status": "SL_MODIFIED" if ok else "SL_MODIFY_FAILED", "message": str(data.get("comment") or mt5.last_error()), "stop_loss": request["sl"], "retcode": data.get("retcode")}
+    return {"status": "SL_MODIFIED" if ok else "SL_MODIFY_FAILED", "message": str(data.get("comment") or mt5.last_error()), "stop_loss": request["sl"], "retcode": data.get("retcode"), "ticket": request["position"], "reason": reason}
 
 
 def close_position(position: Any, reason: str) -> dict[str, Any]:
@@ -1145,13 +1230,39 @@ def manage_live_positions(
         positions = [p for p in (mt5.positions_get(symbol=symbol) or []) if int(getattr(p, "magic", 0) or 0) == TRADE_MAGIC]
         if not positions:
             return {"status": "no_position", "message": "No live algo position."}
+        cancelled_orders: list[int] = []
+        cancel_errors: list[str] = []
         for order in mt5.orders_get(symbol=symbol) or []:
             if int(getattr(order, "magic", 0) or 0) == TRADE_MAGIC:
-                mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": int(order.ticket), "comment": "AlgoCancel"})
+                ticket = int(order.ticket)
+                response = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": ticket, "comment": "AlgoCancel"})
+                data = response._asdict() if response is not None and hasattr(response, "_asdict") else {}
+                if int(data.get("retcode", 0)) == getattr(mt5, "TRADE_RETCODE_DONE", 10009):
+                    cancelled_orders.append(ticket)
+                else:
+                    cancel_errors.append(str(data.get("comment") or mt5.last_error()))
         position = positions[0]
         log_open_position(connection, strategy, position)
+        if cancelled_orders or cancel_errors:
+            add_event_log(
+                connection,
+                "ORDER" if cancelled_orders and not cancel_errors else "ERROR",
+                "OCO_PENDING_CANCEL",
+                f"Position open; cancelled {len(cancelled_orders)} opposite/stale pending order(s).",
+                strategy,
+                {"tickets": cancelled_orders, "errors": cancel_errors},
+            )
         if checked_at >= session_end:
-            return close_position(position, "Algo force exit")
+            action = close_position(position, "Algo force exit")
+            add_event_log(
+                connection,
+                "TRADE" if action.get("status") == "POSITION_CLOSED" else "ERROR",
+                str(action.get("status") or "FORCE_EXIT"),
+                str(action.get("message") or "Session force exit attempted."),
+                strategy,
+                action,
+            )
+            return action
         info = mt5.symbol_info(symbol)
         if info is None:
             return {"status": "error", "message": "Symbol information unavailable."}
@@ -1172,13 +1283,31 @@ def manage_live_positions(
                 improves = current_sl <= 0 or (candidate > current_sl if side == "BUY" else candidate < current_sl)
                 valid_side = candidate < current if side == "BUY" else candidate > current
                 if improves and valid_side:
-                    return {**modify_position_stop(position, candidate, "Second target trail", digits), "stage": "SECOND_TRAIL", "move": move}
+                    action = {**modify_position_stop(position, candidate, "Second target trail", digits), "stage": "SECOND_TRAIL", "move": move}
+                    add_event_log(
+                        connection,
+                        "TRADE" if action["status"] == "SL_MODIFIED" else "ERROR",
+                        action["status"],
+                        f"Second trail SL {'modified' if action['status'] == 'SL_MODIFIED' else 'modify failed'} to {action.get('stop_loss')}",
+                        strategy,
+                        {**action, "side": side, "entry": entry, "current": current, "previous_sl": current_sl},
+                    )
+                    return action
             return {"status": "SECOND_TRAIL_ACTIVE", "message": "Waiting for a better completed trail candle.", "stage": "SECOND_TRAIL", "move": move, "stop_loss": current_sl}
         if move >= first_distance:
             improves = current_sl <= 0 or (first_lock > current_sl if side == "BUY" else first_lock < current_sl)
             valid_side = first_lock < current if side == "BUY" else first_lock > current
             if improves and valid_side:
-                return {**modify_position_stop(position, first_lock, "First target SL lock", digits), "stage": "FIRST_LOCK", "move": move}
+                action = {**modify_position_stop(position, first_lock, "First target SL lock", digits), "stage": "FIRST_LOCK", "move": move}
+                add_event_log(
+                    connection,
+                    "TRADE" if action["status"] == "SL_MODIFIED" else "ERROR",
+                    action["status"],
+                    f"First target SL {'modified' if action['status'] == 'SL_MODIFIED' else 'modify failed'} to {action.get('stop_loss')}",
+                    strategy,
+                    {**action, "side": side, "entry": entry, "current": current, "previous_sl": current_sl},
+                )
+                return action
             return {"status": "FIRST_LOCK_ACTIVE", "message": "First target reached; SL lock is active.", "stage": "FIRST_LOCK", "move": move, "stop_loss": current_sl}
         return {"status": "POSITION_MONITORED", "message": "Live position is being monitored.", "stage": "INITIAL", "move": move, "stop_loss": current_sl}
     finally:
@@ -1220,8 +1349,6 @@ def manage_pending_orders(
             for order in orders:
                 mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": int(order.ticket), "comment": "AlgoCancel"})
             return {"status": "position_open", "message": "Position is open; opposite pending order removed."}
-        if orders:
-            return {"status": "pending_live", "message": f"{len(orders)} pending order(s) live in MT5.", "tickets": [int(o.ticket) for o in orders]}
 
         tick = mt5.symbol_info_tick(symbol)
         info = mt5.symbol_info(symbol)
@@ -1232,11 +1359,18 @@ def manage_pending_orders(
         point = float(getattr(info, "point", 0.0) or 0.0)
         digits = int(getattr(info, "digits", 2) or 2)
         minimum_gap = float(getattr(info, "trade_stops_level", 0) or 0) * point
-        sides = allowed_sides or {"BUY", "SELL"}
-        if "BUY" in sides and buy_trigger <= ask + minimum_gap:
-            return {"status": "level_passed", "message": "BUY trigger is already at/past market price; pending order was not sent."}
-        if "SELL" in sides and sell_trigger >= bid - minimum_gap:
-            return {"status": "level_passed", "message": "SELL trigger is already at/past market price; pending order was not sent."}
+        sides = set(allowed_sides or {"BUY", "SELL"})
+        if strategy.get("entry_pattern") == "BUY_ONLY":
+            sides.discard("SELL")
+        if strategy.get("entry_pattern") == "SELL_ONLY":
+            sides.discard("BUY")
+        existing_sides = {
+            "BUY" if int(getattr(order, "type", -1)) == getattr(mt5, "ORDER_TYPE_BUY_STOP", 4) else "SELL"
+            for order in orders
+        }
+        sides_to_place = sides - existing_sides
+        if not sides_to_place:
+            return {"status": "pending_live", "message": f"{len(orders)} pending order(s) live in MT5.", "tickets": [int(o.ticket) for o in orders]}
 
         volume = float(strategy.get("volume") or 0.01)
         volume_min = float(getattr(info, "volume_min", 0.0) or 0.0)
@@ -1253,7 +1387,7 @@ def manage_pending_orders(
             ("BUY", mt5.ORDER_TYPE_BUY_STOP, buy_trigger, buy_trigger - stop_distance_buy, buy_trigger + target_points if target_points > 0 else 0.0),
             ("SELL", mt5.ORDER_TYPE_SELL_STOP, sell_trigger, sell_trigger + stop_distance_sell, sell_trigger - target_points if target_points > 0 else 0.0),
         ]
-        requests = [item for item in requests if item[0] in sides]
+        requests = [item for item in requests if item[0] in sides_to_place]
         placed: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         success_codes = {getattr(mt5, "TRADE_RETCODE_DONE", 10009), getattr(mt5, "TRADE_RETCODE_PLACED", 10008)}
@@ -1261,6 +1395,12 @@ def manage_pending_orders(
             price = round(float(price), digits)
             stop_loss = round(float(stop_loss), digits)
             take_profit = round(float(take_profit), digits) if take_profit else 0.0
+            if side == "BUY" and price <= ask + minimum_gap:
+                failed.append({"side": side, "ticket": None, "retcode": "level_passed", "message": "BUY trigger is already at/past market price; pending order was not sent.", "price": price, "stop_loss": stop_loss})
+                continue
+            if side == "SELL" and price >= bid - minimum_gap:
+                failed.append({"side": side, "ticket": None, "retcode": "level_passed", "message": "SELL trigger is already at/past market price; pending order was not sent.", "price": price, "stop_loss": stop_loss})
+                continue
             request: dict[str, Any] = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": symbol,
@@ -1288,12 +1428,33 @@ def manage_pending_orders(
         if placed:
             with connection:
                 connection.execute("UPDATE runtime SET pending_order_day = ? WHERE id = 1", (checked_at.date().isoformat(),))
-        return {
-            "status": "pending_live" if len(placed) == len(requests) else "pending_partial" if placed else "pending_failed",
-            "message": f"{len(placed)} pending order(s) placed; {len(failed)} failed.",
+        pending_result = {
+            "status": "pending_live" if len(placed) + len(existing_sides & sides) == len(sides) and not failed else "pending_partial" if placed or existing_sides else "pending_failed",
+            "message": f"{len(placed)} pending order(s) placed; {len(existing_sides & sides)} already live; {len(failed)} failed.",
             "orders": placed,
+            "existing_tickets": [int(o.ticket) for o in orders],
             "errors": failed,
         }
+        if placed:
+            sides_text = ", ".join(f"{item['side']} #{item.get('ticket')} @ {item.get('price')} SL {item.get('stop_loss')}" for item in placed)
+            add_event_log(
+                connection,
+                "ORDER",
+                "PENDING_ORDER_CREATED",
+                f"Pending order created: {sides_text}",
+                strategy,
+                {**pending_result, "requested_sides": sorted(sides), "existing_sides": sorted(existing_sides)},
+            )
+        if failed:
+            add_event_log(
+                connection,
+                "ERROR",
+                "PENDING_ORDER_ISSUE",
+                f"Pending order issue: {len(failed)} failed/skipped",
+                strategy,
+                {**pending_result, "requested_sides": sorted(sides), "existing_sides": sorted(existing_sides)},
+            )
+        return pending_result
     finally:
         mt5.shutdown()
 
@@ -1464,8 +1625,10 @@ def execute_mt5_order(
             raise RuntimeError(f"No live tick returned for {symbol}.")
         order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
         price = float(tick.ask if side == "BUY" else tick.bid)
+        planned_stop = float(signal.get("stop_loss") or 0.0)
         stop_distance = distance_to_points(strategy["stop_points"], strategy["stop_points_unit"], price)
-        stop_loss = price - stop_distance if side == "BUY" else price + stop_distance
+        fallback_stop = price - stop_distance if side == "BUY" else price + stop_distance
+        stop_loss = planned_stop if planned_stop > 0 and (planned_stop < price if side == "BUY" else planned_stop > price) else fallback_stop
         target_points = float(strategy.get("target_points") or 0.0)
         take_profit = 0.0
         if target_points > 0:
@@ -1549,6 +1712,14 @@ def save_trade_log(
             action.get("status") or "",
             json.dumps(payload, separators=(",", ":")),
         ),
+    )
+    add_event_log(
+        connection,
+        "TRADE" if str(action.get("status") or "").upper() in {"ORDER_PLACED", "ORDER_DONE", "DONE", "PLACED"} else "ERROR",
+        str(action.get("status") or "TRADE_LOG"),
+        f"{signal.get('side') or ''} order {action.get('status') or ''} entry {entry_price} SL {payload.get('stop_loss')}",
+        strategy,
+        payload,
     )
 
 
@@ -1803,6 +1974,11 @@ def main() -> int:
         output(handler(connection, payload))
         return 0
     except Exception as exc:
+        try:
+            with connection:
+                add_event_log(connection, "ERROR", f"{command.upper()}_FAILED", str(exc), None, {"command": command, "payload": payload})
+        except Exception:
+            pass
         output({"ok": False, "error": str(exc), "trace": traceback.format_exc()})
         return 1
     finally:

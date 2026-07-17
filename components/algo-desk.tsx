@@ -22,7 +22,9 @@ import {
   Search,
   ShieldCheck,
   Settings,
+  ScrollText,
   Target,
+  Terminal,
   TrendingDown,
   TrendingUp,
   XCircle,
@@ -30,7 +32,7 @@ import {
 import type { ReactNode } from "react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type DeskView = "dashboard" | "settings";
+type DeskView = "dashboard" | "settings" | "logs";
 
 type Strategy = {
   id: string;
@@ -162,6 +164,18 @@ type LogRow = {
   payload?: Record<string, unknown>;
 };
 
+type EventLogRow = {
+  id: number;
+  created_at: string;
+  day_key: string;
+  level: string;
+  event: string;
+  strategy_id: string;
+  symbol: string;
+  message: string;
+  payload?: Record<string, unknown>;
+};
+
 type AlgoState = {
   running: boolean;
   active_strategy_id: string;
@@ -181,6 +195,7 @@ type AlgoState = {
   strategies: Strategy[];
   signal_log: LogRow[];
   trade_log: LogRow[];
+  event_log: EventLogRow[];
   database: string;
 };
 
@@ -462,6 +477,7 @@ export function AlgoDesk({ initialView = "dashboard" }: { initialView?: DeskView
       headerLiveNumber !== null &&
       (headerSide === "BUY" ? headerLiveNumber <= headerStopNumber : headerSide === "SELL" ? headerLiveNumber >= headerStopNumber : false)));
   const isSettings = view === "settings";
+  const isLogs = view === "logs";
 
   const loadSymbols = useCallback(async (query = "") => {
     try {
@@ -478,9 +494,14 @@ export function AlgoDesk({ initialView = "dashboard" }: { initialView?: DeskView
   }, [view]);
 
   useEffect(() => {
-    const onPopState = () => {
-      setView(window.location.pathname === "/settings" ? "settings" : "dashboard");
+    const viewFromLocation = () => {
+      const params = new URLSearchParams(window.location.search);
+      return window.location.pathname === "/settings" ? "settings" : params.get("view") === "logs" ? "logs" : "dashboard";
     };
+    const onPopState = () => {
+      setView(viewFromLocation());
+    };
+    setView(viewFromLocation());
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
@@ -664,7 +685,7 @@ export function AlgoDesk({ initialView = "dashboard" }: { initialView?: DeskView
   }
 
   function navigate(nextView: DeskView) {
-    const href = nextView === "settings" ? "/settings" : "/";
+    const href = nextView === "settings" ? "/settings" : nextView === "logs" ? "/?view=logs" : "/";
     setView(nextView);
     window.history.pushState({}, "", href);
     window.scrollTo(0, 0);
@@ -685,11 +706,14 @@ export function AlgoDesk({ initialView = "dashboard" }: { initialView?: DeskView
           </div>
 
           <nav className="ml-4 grid flex-1 grid-cols-2 gap-2 text-sm lg:ml-0 lg:mt-8 lg:flex-none lg:grid-cols-1">
-            <button className={navClass(!isSettings)} onClick={() => navigate("dashboard")} type="button">
+            <button className={navClass(!isSettings && !isLogs)} onClick={() => navigate("dashboard")} type="button">
               <Activity size={16} /> Dashboard
             </button>
             <button className={navClass(isSettings)} onClick={() => navigate("settings")} type="button">
               <Settings size={16} /> Settings
+            </button>
+            <button className={navClass(isLogs)} onClick={() => navigate("logs")} type="button">
+              <ScrollText size={16} /> Logs
             </button>
             <a className={navClass(false)} href="/chart" rel="noopener noreferrer" target="_blank">
               <ChartNoAxesCombined size={16} /> Chart
@@ -718,8 +742,8 @@ export function AlgoDesk({ initialView = "dashboard" }: { initialView?: DeskView
             status={headerStopLossHit ? "Stop loss hit." : state?.algo_status || "Loading..."}
             strategy={selectedStrategy}
             lastSignalAt={activeSignal.checked_at}
-            title={isSettings ? "Strategy Settings" : "Trading Dashboard"}
-            subtitle={isSettings ? "Manage your strategy configuration." : "Today signal, entry, stop loss, and trail status in one place."}
+            title={isSettings ? "Strategy Settings" : isLogs ? "Technical Logs" : "Trading Dashboard"}
+            subtitle={isSettings ? "Manage your strategy configuration." : isLogs ? "Daily technical event logs for order and SL tracking." : "Today signal, entry, stop loss, and trail status in one place."}
             lastError={state?.last_error}
             socketConnected={socketConnected}
             onCheck={() => void control("check")}
@@ -763,6 +787,8 @@ export function AlgoDesk({ initialView = "dashboard" }: { initialView?: DeskView
               onSave={saveStrategy}
               onSymbolSearch={loadSymbols}
             />
+          ) : isLogs ? (
+            <LogsView logs={state?.event_log || []} />
           ) : (
             <DashboardView
               activeSignal={activeSignal}
@@ -1179,6 +1205,69 @@ export function ChartOnlyPage() {
   );
 }
 
+function LogsView({ logs }: { logs: EventLogRow[] }) {
+  const ordered = [...logs].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  const latest = ordered[0];
+  const levelClass = (level: string) => {
+    const text = level.toUpperCase();
+    if (text === "ERROR") return "border-rose-500/40 bg-rose-500/10 text-rose-200";
+    if (text === "ORDER") return "border-cyan-400/40 bg-cyan-400/10 text-cyan-100";
+    if (text === "TRADE") return "border-emerald-400/40 bg-emerald-400/10 text-emerald-100";
+    if (text === "SIGNAL") return "border-amber-300/40 bg-amber-300/10 text-amber-100";
+    return "border-slate-500/40 bg-slate-500/10 text-slate-200";
+  };
+
+  return (
+    <div className="mx-auto mt-3 max-w-[1460px]">
+      <section className="overflow-hidden rounded-xl border border-slate-800 bg-[#05070b] shadow-[0_18px_50px_rgba(2,6,23,0.22)]">
+        <div className="flex flex-wrap items-center gap-3 border-b border-slate-800 bg-[#090d14] px-4 py-3 text-slate-200">
+          <div className="grid h-10 w-10 place-items-center rounded-lg border border-emerald-400/20 bg-emerald-400/10 text-emerald-200">
+            <Terminal size={20} />
+          </div>
+          <div>
+            <h2 className="text-base font-semibold text-white">Daily Technical Logs</h2>
+            <p className="text-xs text-slate-400">Auto-clears when the trading day changes. Latest: {latest ? compactTime(latest.created_at) : "-"}</p>
+          </div>
+          <span className="ml-auto rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs font-semibold text-slate-300">
+            {ordered.length} events today
+          </span>
+        </div>
+
+        <div className="max-h-[calc(100vh-230px)] min-h-[520px] overflow-auto p-3 font-mono text-[12px] leading-relaxed">
+          {ordered.length ? (
+            <div className="grid gap-2">
+              {ordered.map((item) => (
+                <article key={item.id} className="rounded-lg border border-slate-800 bg-black/45 px-3 py-2 text-slate-300">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-slate-500">{compactTime(item.created_at)}</span>
+                    <span className={`rounded-md border px-2 py-0.5 text-[11px] font-bold ${levelClass(item.level)}`}>{item.level}</span>
+                    <span className="text-emerald-200">{item.event}</span>
+                    {item.symbol && <span className="rounded bg-slate-900 px-1.5 py-0.5 text-slate-400">{item.symbol}</span>}
+                  </div>
+                  <div className="mt-1 whitespace-pre-wrap text-slate-100">{item.message}</div>
+                  {item.payload && Object.keys(item.payload).length > 0 && (
+                    <pre className="mt-2 max-h-36 overflow-auto rounded border border-slate-800 bg-[#030508] p-2 text-[11px] text-slate-400">
+                      {JSON.stringify(item.payload, null, 2)}
+                    </pre>
+                  )}
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="grid h-[420px] place-items-center text-center text-slate-500">
+              <div>
+                <Terminal className="mx-auto mb-3 text-slate-700" size={34} />
+                <div className="text-sm text-slate-300">No technical logs yet today.</div>
+                <div className="mt-1 text-xs">Order, signal, SL modify, and error events will appear here.</div>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function DashboardView({
   activeSignal,
   hasSignal,
@@ -1222,8 +1311,9 @@ function DashboardView({
   const displayLivePrice = side === "BUY" || side === "SELL" ? liveExitPrice(side, liveQuote) : toNumber(liveQuote.last) ?? toNumber(liveQuote.bid);
   const livePoints = trailPlan.move;
   const tradeAction = activeSignal.trade_action;
-  const buyLevel = signalToday ? toNumber(activeSignal.buy_trigger) : null;
-  const sellLevel = signalToday ? toNumber(activeSignal.sell_trigger) : null;
+  const rangeReady = signalToday && activeSignal.phase !== "WAIT_RANGE" && activeSignal.phase !== "WAIT_SESSION";
+  const buyLevel = rangeReady ? toNumber(activeSignal.buy_trigger) : null;
+  const sellLevel = rangeReady ? toNumber(activeSignal.sell_trigger) : null;
   const marketPrice = toNumber(liveQuote.last) ?? toNumber(liveQuote.bid) ?? toNumber(liveQuote.ask);
   const buyTriggered = hasSignal && side === "BUY";
   const sellTriggered = hasSignal && side === "SELL";
@@ -1369,11 +1459,13 @@ function DashboardView({
                 )}
               </div>
             </div>
-            <p className="mt-1 text-sm text-slate-500">Exact prices where the system will detect a BUY or SELL breakout.</p>
+            <p className="mt-1 text-sm text-slate-500">
+              {rangeReady ? "Exact prices where the system will detect a BUY or SELL breakout." : "Breakout trigger prices will appear after the range window closes."}
+            </p>
 
             <div className="mt-3 grid gap-3 md:grid-cols-2">
               <TradeLevelCard
-                enabled={selectedStrategy.entry_pattern !== "SELL_ONLY"}
+                enabled={rangeReady && selectedStrategy.entry_pattern !== "SELL_ONLY"}
                 icon={<TrendingUp size={24} />}
                 label="BUY above"
                 level={buyLevel}
@@ -1382,7 +1474,9 @@ function DashboardView({
                 plan={buyPlan}
                 onUpdate={(price) => onUpdateLevel("BUY", price)}
                 note={
-                  buyClosedByOco
+                  !rangeReady
+                    ? activeSignal.message || "Range window is still forming."
+                    : buyClosedByOco
                     ? buyPending
                       ? "SELL position is open - cancelling opposite BUY order in MT5"
                       : "SELL position is open - opposite BUY order was cancelled by OCO"
@@ -1400,7 +1494,7 @@ function DashboardView({
                 triggered={buyTriggered}
               />
               <TradeLevelCard
-                enabled={selectedStrategy.entry_pattern !== "BUY_ONLY"}
+                enabled={rangeReady && selectedStrategy.entry_pattern !== "BUY_ONLY"}
                 icon={<TrendingDown size={24} />}
                 label="SELL below"
                 level={sellLevel}
@@ -1409,7 +1503,9 @@ function DashboardView({
                 plan={sellPlan}
                 onUpdate={(price) => onUpdateLevel("SELL", price)}
                 note={
-                  sellClosedByOco
+                  !rangeReady
+                    ? activeSignal.message || "Range window is still forming."
+                    : sellClosedByOco
                     ? sellPending
                       ? "BUY position is open - cancelling opposite SELL order in MT5"
                       : "BUY position is open - opposite SELL order was cancelled by OCO"
@@ -1809,7 +1905,7 @@ function TradeLevelCard({
         </div>
       )}
       <div className={`mt-4 rounded-lg border px-3 py-2 text-sm ${enabled ? (green ? "border-emerald-100 bg-emerald-50/80" : "border-rose-100 bg-rose-50/80") : "border-slate-200 bg-white"}`}>
-        {enabled ? note : `${label.split(" ")[0]} entries are disabled in this strategy.`}
+        {enabled ? note : note || `${label.split(" ")[0]} entries are disabled in this strategy.`}
       </div>
       {enabled && level !== null && (
         <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-600 sm:grid-cols-4">
