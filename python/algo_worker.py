@@ -872,9 +872,9 @@ def scan_signal(connection: sqlite3.Connection, strategy_id: str | None = None) 
         )
         first_trail_stop = first_trail_lock_stop(entry_reference, first_lock_distance, side)
         second_trail_trigger = (
-            entry_reference + first_trail_distance + second_trail_distance
+            entry_reference + second_trail_distance
             if side == "BUY"
-            else entry_reference - first_trail_distance - second_trail_distance
+            else entry_reference - second_trail_distance
         )
         result.update(
             {
@@ -1276,7 +1276,7 @@ def manage_live_positions(
         lock_distance = distance_to_points(strategy["first_trail_lock_loss"], strategy["first_trail_lock_loss_unit"], entry)
         second_distance = distance_to_points(strategy["second_trail_profit"], strategy["second_trail_profit_unit"], entry)
         first_lock = entry + lock_distance if side == "BUY" else entry - lock_distance
-        if move >= first_distance + second_distance:
+        if move >= second_distance:
             candle_stop = last_completed_trail_level(symbol, strategy["trail_timeframe"], side)
             if candle_stop is not None:
                 candidate = max(first_lock, candle_stop) if side == "BUY" else min(first_lock, candle_stop)
@@ -1548,7 +1548,7 @@ def update_pending_trigger(
             "stop_loss": stop_loss,
             "first_target": price + first_distance if side == "BUY" else price - first_distance,
             "first_lock": price + lock_distance if side == "BUY" else price - lock_distance,
-            "second_target": price + first_distance + second_distance if side == "BUY" else price - first_distance - second_distance,
+            "second_target": price + second_distance if side == "BUY" else price - second_distance,
         }
     finally:
         mt5.shutdown()

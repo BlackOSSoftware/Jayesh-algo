@@ -372,7 +372,7 @@ function buildTrailPlan(strategy: Strategy, signal: Signal, trade?: LogRow, quot
   const secondDistance = distanceToPoints(strategy.second_trail_profit, strategy.second_trail_profit_unit, entry);
   const firstTrigger = levelFrom(entry, side, firstDistance, "profit");
   const firstStop = firstTrailLockStop(entry, side, firstLockDistance);
-  const secondTrigger = levelFrom(entry, side, firstDistance + secondDistance, "profit");
+  const secondTrigger = levelFrom(entry, side, secondDistance, "profit");
   const move = lastClose === null ? null : side === "BUY" ? lastClose - entry : entry - lastClose;
   const firstHit = move !== null && move >= firstDistance;
   const firstStopHit =
@@ -380,7 +380,7 @@ function buildTrailPlan(strategy: Strategy, signal: Signal, trade?: LogRow, quot
     firstStop !== null &&
     lastClose !== null &&
     (side === "BUY" ? lastClose <= firstStop : lastClose >= firstStop);
-  const secondHit = move !== null && move >= firstDistance + secondDistance;
+  const secondHit = move !== null && move >= secondDistance;
 
   return { side, entry, initialStop, firstTrigger, firstStop, secondTrigger, move, firstHit, firstStopHit, secondHit };
 }
@@ -395,7 +395,7 @@ function tradeLevelPlan(strategy: Strategy, level: number | null, side: "BUY" | 
     stop: side === "BUY" ? level - stopDistance : level + stopDistance,
     first: side === "BUY" ? level + firstDistance : level - firstDistance,
     lock: side === "BUY" ? level + lockDistance : level - lockDistance,
-    second: side === "BUY" ? level + firstDistance + secondDistance : level - firstDistance - secondDistance,
+    second: side === "BUY" ? level + secondDistance : level - secondDistance,
   };
 }
 
